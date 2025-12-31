@@ -23,11 +23,18 @@ const MOD_PICKER = "expo-image-picker";
 
 function safeRequire(id) {
   try {
-    return require(id);
+    if (id === MOD_ASYNC) return require("@react-native-async-storage/async-storage");
+    if (id === MOD_PICKER) return require("expo-image-picker");
+    if (id === "@react-navigation/native") return require("@react-navigation/native");
+    if (id === "@react-navigation/bottom-tabs") return require("@react-navigation/bottom-tabs");
+    if (id === "@react-navigation/native-stack") return require("@react-navigation/native-stack");
+    return null;
   } catch (e) {
     return null;
   }
 }
+
+
 
 let AsyncStorage = null;
 try {
