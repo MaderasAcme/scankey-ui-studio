@@ -383,9 +383,6 @@ async function queueFeedback(payload) {
     { id: String(Date.now()), createdAt: Date.now(), payload },
     ...list,
   ];
-  await savePendingFeedback(next);
-  return next.length;
-}
 
 async function flushPendingFeedback() {
   const list = await loadPendingFeedback();
