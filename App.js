@@ -76,10 +76,10 @@ const STORAGE_KEY_PENDING_FEEDBACK = "scankey_pending_feedback_v1";
 // Cloud Run endpoints (REAL)
 // =====================
 // ✅ CAMBIA SOLO ESTO SI TU URL ES OTRA
-const MOTOR_BASE = "https://classify-llaves-2apb4vvlhq-ew.a.run.app";
+const MOTOR_BASE = "https://classify-llaves-578907855193.europe-southwest1.run.app";
 const API_ANALYZE = `${MOTOR_BASE}/api/analyze-key`;
 const API_FEEDBACK = `${MOTOR_BASE}/api/feedback`;
-const API_HEALTH = `${MOTOR_BASE}/api/health`;
+const API_HEALTH = `${MOTOR_BASE}/health`;
 
 // =====================
 // Storage helpers
@@ -339,10 +339,9 @@ async function postAnalyzeReal(frontUri, backUri, modoTaller, onAttempt) {
   const fd = new FormData();
 
   await appendFileToFormData(fd, "front", frontUri, "front.jpg");
-  await appendFileToFormData(fd, "back", backUri, "back.jpg");
+  if (backUri) await appendFileToFormData(fd, "back", backUri, "back.jpg");
   await appendFileToFormData(fd, "image_front", frontUri, "front.jpg");
-  await appendFileToFormData(fd, "image_back", backUri, "back.jpg");
-
+  if (backUri) await appendFileToFormData(fd, "image_back", backUri, "back.jpg");
   fd.append("source", "app");
   fd.append("modo_taller", String(!!modoTaller));
 
@@ -383,9 +382,6 @@ async function queueFeedback(payload) {
     { id: String(Date.now()), createdAt: Date.now(), payload },
     ...list,
   ];
-  await savePendingFeedback(next);
-  return next.length;
-}
 
 async function flushPendingFeedback() {
   const list = await loadPendingFeedback();
