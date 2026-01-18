@@ -3,7 +3,7 @@ steps:
     args:
       - build
       - -t
-      - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey/scankey-v1a1-backend:$SHORT_SHA
+      - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey-repo/scankey-v1a1-backend:$SHORT_SHA
       - -f
       - backend/Dockerfile
       - backend
@@ -11,7 +11,7 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - push
-      - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey/scankey-v1a1-backend:$SHORT_SHA
+      - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey-repo/scankey-v1a1-backend:$SHORT_SHA
 
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
@@ -19,7 +19,7 @@ steps:
       - deploy
       - scankey-v1a1-backend
       - --image
-      - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey/scankey-v1a1-backend:$SHORT_SHA
+      - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey-repo/scankey-v1a1-backend:$SHORT_SHA
       - --region
       - europe-southwest1
       - --allow-unauthenticated
@@ -27,7 +27,7 @@ steps:
       - "8080"
 
 images:
-  - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey/scankey-v1a1-backend:$SHORT_SHA
+  - europe-west1-docker.pkg.dev/$PROJECT_ID/scankey-repo/scankey-v1a1-backend:$SHORT_SHA
 
 options:
   logging: CLOUD_LOGGING_ONLY
