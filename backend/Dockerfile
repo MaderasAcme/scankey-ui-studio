@@ -4,10 +4,11 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-COPY backend/requirements.txt /app/requirements.txt
+# OJO: el build context es "backend", por eso aquí NO va "backend/..."
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY backend/ /app/
+COPY . /app/
 
 ENV PORT=8080
 EXPOSE 8080
