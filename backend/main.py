@@ -3,7 +3,14 @@ from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
 
-from ocr_engine import run_ocr
+import ocr_engine
+
+# OCR opcional: no dejes que un cambio en OCR tumbe el backend en Cloud Run
+run_ocr = getattr(ocr_engine, "run_ocr", None)
+if run_ocr is None:
+    def run_ocr(*args, **kwargs):
+        return {"text": "", "confidence": 0.0, "enabled": False}
+
 
 app = FastAPI(title="ScanKey OCR Backend", version="v1")
 
