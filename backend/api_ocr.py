@@ -1,5 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, Header
-from .modules.ocr_dual import is_workshop_authorized, ocr_placeholder
+try:
+    from .modules.ocr_dual import is_workshop_authorized, ocr_placeholder
+except ImportError:
+    from modules.ocr_dual import is_workshop_authorized, ocr_placeholder
 
 router = APIRouter(prefix="/api", tags=["ocr"])
 

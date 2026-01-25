@@ -1,6 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, Form
-from .api_ocr import router as ocr_router
-
+try:
+    from .api_ocr import router as ocr_router
+except ImportError:
+    from api_ocr import router as ocr_router
 from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
