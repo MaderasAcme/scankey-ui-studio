@@ -3,10 +3,7 @@ from __future__ import annotations
 import os, argparse
 from pathlib import Path
 
-try:
-    from PIL import Image
-except Exception:
-    raise SystemExit("Instala pillow: python3 -m pip install --user pillow")
+from PIL import Image
 
 IMG_EXT={".jpg",".jpeg",".png",".webp"}
 
@@ -42,7 +39,7 @@ def main():
     ap.add_argument("--aux", default=os.path.expanduser("~/WORK/scankey/train_inbox/BAD/AUX/UNSORTED"))
     ap.add_argument("--v1", default=os.path.expanduser("~/WORK/scankey/datasets/v1"))
     ap.add_argument("--v2", default=os.path.expanduser("~/WORK/scankey/datasets/v2"))
-    ap.add_argument("--maxdist", type=int, default=12, help="umbral hamming (8-14 típico)")
+    ap.add_argument("--maxdist", type=int, default=12)
     args=ap.parse_args()
 
     aux=Path(args.aux)
@@ -52,8 +49,10 @@ def main():
     v2A.mkdir(parents=True, exist_ok=True); v2B.mkdir(parents=True, exist_ok=True)
 
     refA=imgs(v1/"A"); refB=imgs(v1/"B")
-    if not refA and not refB:
-        raise SystemExit("No hay refs en v1 para comparar")
+    if not refA:
+        raise SystemExit("No hay refs A en v1")
+    if not refB:
+        raise SystemExit("No hay refs B en v1 (B=0). No se puede clasificar a B todavía.")
 
     movedA=movedB=kept=0
     for p in imgs(aux):
@@ -67,6 +66,7 @@ def main():
         print(f"MOVE {p.name} -> {side} (dist={dist})")
         movedA += (side=="A")
         movedB += (side=="B")
+
     print(f"DONE movedA={movedA} movedB={movedB} kept={kept}")
 
 if __name__=="__main__":
