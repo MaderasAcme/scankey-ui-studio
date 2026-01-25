@@ -7,8 +7,10 @@ from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
 
-import ocr_engine
-
+try:
+    from . import ocr_engine
+except ImportError:
+    import ocr_engine
 # OCR opcional: no dejes que un cambio en OCR tumbe el backend en Cloud Run
 run_ocr = getattr(ocr_engine, "run_ocr", None)
 if run_ocr is None:
