@@ -56,3 +56,4 @@ backup-base44/
 __pycache__/
 backend/__pycache__/
 backend/modules/__pycache__/
+requirements.txt
