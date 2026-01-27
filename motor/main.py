@@ -389,3 +389,47 @@ def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), mo
 
     return {"ok": True, "candidates": cands, "store": store}
 
+
+@app.post("/api/analyze-key")
+def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), modo: str | None = None):
+    data = front.file.read()
+    if not data:
+        raise HTTPException(400, "archivo vacío")
+
+    try:
+        img = Image.open(BytesIO(data)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "imagen inválida")
+
+    store = _maybe_store_sample_to_gcs(data, getattr(front, "filename", "") or "front.jpg", modo)
+
+    cands = _predict(img)
+
+    # Sidecar JSON SOLO si se guardó imagen (y NUNCA rompe)
+    if store.get("stored"):
+        meta = {
+            "ts_unix": int(time.time()),
+            "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "modo": (modo or "").strip().lower(),
+            "candidates": cands,
+            "top_label": (cands[0]["label"] if cands else None),
+            "top_score": (cands[0]["score"] if cands else None),
+            "img": {
+                "filename": (getattr(front, "filename", "") or "front.jpg"),
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            },
+            "runtime": {
+                "service": os.getenv("K_SERVICE", ""),
+                "revision": os.getenv("K_REVISION", ""),
+                "project": os.getenv("GOOGLE_CLOUD_PROJECT", ""),
+            },
+            "model": {
+                "model_gcs_uri": os.getenv("MODEL_GCS_URI", ""),
+                "labels_gcs_uri": os.getenv("LABELS_GCS_URI", ""),
+            },
+        }
+        store["meta"] = _maybe_store_meta_to_gcs(meta, store.get("gcs_uri", ""))
+
+    return {"ok": True, "candidates": cands, "store": store}
+
