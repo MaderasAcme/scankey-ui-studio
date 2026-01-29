@@ -57,3 +57,9 @@ __pycache__/
 backend/__pycache__/
 backend/modules/__pycache__/
 requirements.txt
+
+# seguridad
+github-recovery-codes.txt
+*.env
+credentials.json
+
