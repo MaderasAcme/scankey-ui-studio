@@ -221,12 +221,26 @@ def match_tokens(tokens):
     # best_ref: 1) mayor frecuencia 2) aparece antes 3) más corto
     best = None
     if hits:
-        cnt = Counter([h["canon"] for h in hits])
+        # 1) prioriza EXACT; si no hay exact, usa todo (incluye confusion)
+        exact_hits = [h for h in hits if h.get('match_kind') == 'exact']
+        pool = exact_hits if exact_hits else hits
+    
+        # frecuencia
+        cnt = Counter([h['canon'] for h in pool])
+    
+        # 2) aparece antes (index menor)
+        first_pos = {}
+        for h in pool:
+            c = h['canon']
+            idx = int(h.get('index', 10**9))
+            if c not in first_pos or idx < first_pos[c]:
+                first_pos[c] = idx
+    
+        # 3) más corto (y estable)
         best = sorted(
             cnt.items(),
-            key=lambda kv: (-kv[1], first_idx.get(kv[0], 10**9), len(kv[0]), kv[0])
+            key=lambda kv: (-kv[1], first_pos.get(kv[0], 10**9), len(kv[0]), kv[0])
         )[0][0]
-
     return {
         "tokens_raw": tokens,
         "catalog_hits": hits,
