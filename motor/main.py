@@ -32,6 +32,10 @@ _LABELS = None
 
 app = FastAPI()
 
+def _canon(x: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", (x or "").upper())
+
+
 def _safe_name(name: str, max_len: int = 80) -> str:
     name = (name or "front.jpg").strip()
     out = []
@@ -285,7 +289,7 @@ def _softmax(v):
     return e / s if s > 0 else np.ones_like(v) / float(v.size)
 
 
-def _predict(img: PILImage.Image):
+def _predict(img: PILImage.Image, ref_hint: str | None = None):
     sess = _ensure_session()
     inp = sess.get_inputs()[0]
     x = _preprocess(img, inp.shape)
@@ -297,6 +301,30 @@ def _predict(img: PILImage.Image):
     scores = y[0]
 
     probs = _softmax(scores)
+
+    hint = {
+        "provided": (ref_hint or None),
+        "canon": None,
+        "applied": False,
+        "matched_label": None,
+        "boost": None,
+    }
+
+    hc = _canon(ref_hint) if ref_hint else ""
+    if hc and _LABELS:
+        hint["canon"] = hc
+        for j, lab in enumerate(_LABELS):
+            if _canon(lab) == hc:
+                boost = float(os.getenv("HINT_BOOST", "1.35"))
+                hint["boost"] = boost
+                probs[j] = probs[j] * boost
+                ss = float(probs.sum())
+                if ss > 0:
+                    probs = probs / ss
+                hint["applied"] = True
+                hint["matched_label"] = lab
+                break
+
     n = probs.size
 
     labels = _LABELS or []
@@ -308,7 +336,7 @@ def _predict(img: PILImage.Image):
         idx = int(idx)
         label = labels[idx] if idx < len(labels) else f"CLASS_{idx}"
         cands.append({"label": label, "score": float(probs[idx]), "idx": idx})
-    return cands
+    return cands, hint
 
 
 @app.get("/debug/routes")
@@ -346,7 +374,7 @@ def _store_meta_sidecar(meta: dict, img_gcs_uri: str):
         return {"stored": False, "reason": str(e)}
 
 @app.post("/api/analyze-key")
-def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), modo: str | None = None):
+def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), modo: str | None = None, ref_hint: str | None = None):
     data = front.file.read()
     if not data:
         raise HTTPException(400, "archivo vacío")
@@ -357,7 +385,7 @@ def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), mo
         raise HTTPException(400, f"imagen inválida ({type(e).__name__}: {e}) len={len(data) if data else 0} first16={(data[:16].hex() if data else None)} ct={getattr(front, 'content_type', None)} fn={getattr(front, 'filename', None)}")
 
     # 1) inferencia
-    cands = _predict(img)
+    cands, hint = _predict(img, ref_hint)
 
     # 2) store imagen (si modo=taller y flag activo)
     store = _maybe_store_sample_to_gcs(data, getattr(front, "filename", "") or "front.jpg", modo)
@@ -377,6 +405,7 @@ def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), mo
                 "candidates": cands,
                 "top_label": (cands[0]["label"] if cands else None),
                 "top_score": (cands[0]["score"] if cands else None),
+                "hint": hint,
             },
             "runtime": {
                 "service": os.getenv("K_SERVICE", ""),
@@ -390,7 +419,7 @@ def analyze_key(front: UploadFile = File(...), back: UploadFile = File(None), mo
         }
         store["meta"] = _store_meta_sidecar(meta, store["gcs_uri"])
 
-    return {"ok": True, "candidates": cands, "store": store}
+    return {"ok": True, "candidates": cands, "hint": hint, "store": store}
 
 
 
