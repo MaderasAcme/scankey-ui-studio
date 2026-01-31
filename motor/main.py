@@ -352,6 +352,27 @@ def _parse_gs(uri: str):
     b, o = rest.split("/", 1)
     return b, o
 
+
+
+def _store_feedback_sidecar(meta: dict, img_gcs_uri: str):
+    # Guarda feedback como .feedback.json junto a la imagen. Nunca rompe el request si falla.
+    try:
+        bucket, obj = _parse_gs(img_gcs_uri)
+        if not bucket or not obj:
+            return {"stored": False, "reason": "gcs_uri inválida"}
+
+        fb_obj = re.sub(r'\.(jpg|jpeg|png|webp)$', '.feedback.json', obj, flags=re.I)
+        if fb_obj == obj:
+            fb_obj = obj + ".feedback.json"
+
+        client = storage.Client()
+        blob = client.bucket(bucket).blob(fb_obj)
+        payload = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+        blob.upload_from_string(payload.encode("utf-8"), content_type="application/json")
+        return {"stored": True, "gcs_uri": f"gs://{bucket}/{fb_obj}"}
+    except Exception as e:
+        return {"stored": False, "reason": str(e)}
+
 def _store_meta_sidecar(meta: dict, img_gcs_uri: str):
     # Nunca rompe el request si falla
     try:
@@ -462,3 +483,46 @@ def debug_open_image(front: UploadFile = File(...)):
     except Exception as e:
         info.update({"ok": False, "err_type": type(e).__name__, "err": str(e)})
         return info
+
+
+@app.post("/api/feedback")
+def feedback(
+    gcs_uri: str,
+    ref_final: str,
+    ref_source: str = "confirmed",  # confirmed|corrected|auto
+    ref_best: str | None = None,
+    taller_id: str | None = None,
+    country: str | None = None,
+    city: str | None = None,
+    note: str | None = None,
+):
+    if not gcs_uri:
+        raise HTTPException(400, "gcs_uri requerido")
+    if not ref_final:
+        raise HTTPException(400, "ref_final requerido")
+
+    meta = {
+        "ts_unix": int(time.time()),
+        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "gcs_uri": gcs_uri,
+        "ref_best": (ref_best or None),
+        "ref_best_canon": _canon(ref_best) if ref_best else None,
+        "ref_final": ref_final,
+        "ref_final_canon": _canon(ref_final),
+        "ref_source": (ref_source or "").strip().lower(),
+        "ctx": {
+            "taller_id": (taller_id or None),
+            "country": (country or None),
+            "city": (city or None),
+        },
+        "note": (note or None),
+        "runtime": {
+            "service": os.getenv("K_SERVICE", ""),
+            "revision": os.getenv("K_REVISION", ""),
+            "project": os.getenv("GOOGLE_CLOUD_PROJECT", ""),
+        },
+    }
+
+    stored = _store_feedback_sidecar(meta, gcs_uri)
+    return {"ok": True, "stored": stored}
+
