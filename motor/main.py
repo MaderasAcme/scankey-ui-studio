@@ -1,6 +1,8 @@
 import hashlib
 import re
 import os
+import catalog as _catalog
+_catalog.load()
 import time
 import json
 import uuid
@@ -8,12 +10,14 @@ import random
 import threading
 import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
+import datetime
 
 from google.cloud import storage
 import onnxruntime as ort
 from PIL import Image as PILImage
 import io
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from model_bootstrap import ensure_model
@@ -37,6 +41,27 @@ _LABELS: Optional[List[str]] = None
 app = FastAPI()
 
 
+
+
+# --- ScanKey bootstrap event (REAL) ---
+@app.on_event("startup")
+def _scankey_bootstrap_event():
+    from model_bootstrap import ensure_model
+    print("BOOTSTRAP event_start", flush=True)
+    try:
+        ok = ensure_model()
+        print(f"BOOTSTRAP event_done ok={ok}", flush=True)
+    except Exception as e:
+        print(f"BOOTSTRAP event_failed err={type(e).__name__}:{e}", flush=True)
+        raise
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 def _canon(x: Optional[str]) -> str:
     return re.sub(r"[^A-Z0-9]+", "", (x or "").upper())
 
@@ -119,6 +144,61 @@ def _maybe_store_sample_to_gcs(raw_bytes: bytes, filename_hint: str, modo: str, 
         return {"stored": True, "gcs_uri": gcs_uri, "side": side2}
     except Exception as e:
         return {"stored": False, "reason": f"store_error: {type(e).__name__}: {e}", "gcs_uri": gcs_uri, "side": side2}
+
+
+
+def _store_copy_to_keys_date(raw_bytes: bytes, filename_hint: str, input_id: str, side: str, sample_gcs_uri: Optional[str] = None, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Dual-store: además de samples/{A,B}/..., guarda una copia en keys/YYYY/MM/DD/...
+    Se puede desactivar con STORE_DUAL_KEYS=0
+    """
+    if (os.getenv("STORE_DUAL_KEYS", "1") or "1").strip() != "1":
+        return {"stored_keys": False, "keys_reason": "STORE_DUAL_KEYS=0"}
+
+    bucket_name = (os.getenv("GCS_BUCKET", "") or "").strip()
+    if not bucket_name:
+        return {"stored_keys": False, "keys_reason": "GCS_BUCKET vacío"}
+
+    safe = (filename_hint or "").split("/")[-1].split("\\")[-1].strip() or "image.jpg"
+    low = safe.lower()
+    ext = ".png" if low.endswith(".png") else ".jpg"
+    ct  = "image/png" if ext == ".png" else "image/jpeg"
+
+    dt = datetime.datetime.utcnow()
+    date_path = dt.strftime("%Y/%m/%d")
+    kind = "front" if (side or "").upper() == "A" else "back"
+
+    img_obj  = f"keys/{date_path}/{input_id}_{kind}{ext}"
+    meta_obj = f"keys/{date_path}/{input_id}_{kind}.json"
+
+    try:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+
+        bucket.blob(img_obj).upload_from_string(raw_bytes, content_type=ct)
+
+        meta = {
+            "input_id": input_id,
+            "side": side,
+            "kind": kind,
+            "filename_hint": safe,
+            "stored_at": dt.replace(microsecond=0).isoformat() + "Z",
+            "sample_gcs_uri": sample_gcs_uri,
+            "analysis": analysis,
+        }
+        bucket.blob(meta_obj).upload_from_string(
+            json.dumps(meta, ensure_ascii=False),
+            content_type="application/json"
+        )
+
+        return {
+            "stored_keys": True,
+            "gcs_uri_keys": f"gs://{bucket_name}/{img_obj}",
+            "meta_keys": {"stored": True, "gcs_uri": f"gs://{bucket_name}/{meta_obj}"},
+        }
+    except Exception as e:
+        return {"stored_keys": False, "keys_reason": str(e)}
 
 
 def _store_json_sidecar(bucket_name: str, obj: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -296,6 +376,13 @@ def _ensure_session():
 
 @app.on_event("startup")
 def startup():
+    from model_bootstrap import ensure_model
+    try:
+        ensure_model()
+        print('BOOTSTRAP startup_after_ensure', flush=True)
+    except Exception as e:
+        print(f'BOOTSTRAP startup_failed err={type(e).__name__}:{e}', flush=True)
+        raise
     _ensure_session()
 
 
@@ -341,7 +428,7 @@ def _predict(img: PILImage.Image, ref_hint: Optional[str] = None) -> Tuple[List[
     for idx in idxs:
         idx = int(idx)
         label = labels[idx] if idx < len(labels) else f"CLASS_{idx}"
-        cands.append({"label": label, "score": float(probs[idx]), "idx": idx})
+        cands.append({"label": label, "score": float(np.asarray(probs).reshape(-1)[int(idx)]), "idx": int(idx)})
 
     return cands, hint
 
@@ -350,11 +437,11 @@ def _predict(img: PILImage.Image, ref_hint: Optional[str] = None) -> Tuple[List[
 def analyze_key(
     front: UploadFile = File(...),
     back: UploadFile = File(None),
-    modo: Optional[str] = None,
+    modo: Optional[str] = Form(None),
     ref_hint: Optional[str] = None,
     image_front: Optional[UploadFile] = File(None),
     image_back: Optional[UploadFile] = File(None),
-    modo_taller: Optional[str] = None,
+    modo_taller: Optional[str] = Form(None),
 ):
     front_up = front or image_front
     back_up = back or image_back
@@ -405,7 +492,7 @@ def analyze_key(
     high_confidence = top_score >= 0.95
     low_confidence = top_score < 0.60
 
-    storage_probability = 0.75
+    storage_probability = float(__import__("os").getenv("STORAGE_PROBABILITY","0.75"))
     should_store_sample = False
     current_samples_for_candidate = -1
 
@@ -434,8 +521,24 @@ def analyze_key(
 
     if should_store_sample:
         store = _maybe_store_sample_to_gcs(data, getattr(front_up, "filename", "") or "front.jpg", modo2, side="A")
+        if store.get("stored"):
+            store.update(_store_copy_to_keys_date(
+                raw_bytes=data,
+                filename_hint=(getattr(front_up, "filename", "") or "front.jpg"),
+                input_id=input_id,
+                side="A",
+                sample_gcs_uri=store.get("gcs_uri"),
+            ))
         if raw_back and len(raw_back) > 1000:
             store_back = _maybe_store_sample_to_gcs(raw_back, getattr(back_up, "filename", "") or "back.jpg", modo2, side="B")
+            if store_back.get("stored"):
+                store_back.update(_store_copy_to_keys_date(
+                    raw_bytes=raw_back,
+                    filename_hint=(getattr(back_up, "filename", "") or "back.jpg"),
+                    input_id=input_id,
+                    side="B",
+                    sample_gcs_uri=store_back.get("gcs_uri"),
+                ))
 
     base_meta = {
         "input_id": input_id,
@@ -650,3 +753,76 @@ def feedback(
 @app.on_event("startup")
 def _startup2():
     _ensure_session()
+
+
+# --- Catalog endpoints ---
+@app.get("/api/catalog/version")
+def api_catalog_version():
+    return _catalog.version()
+
+@app.get("/api/catalog/{ref}")
+def api_catalog_ref(ref: str):
+    it = _catalog.get(ref)
+    if not it:
+        return {"ok": False, "error": "not_found", "ref": ref}
+    return {"ok": True, "ref": ref, "item": it}
+
+@app.get("/__build")
+def __build():
+    import os
+    return {"ok": True, "deploy_stamp": os.getenv("DEPLOY_STAMP","")}
+
+# --- ScanKey debug (solo para diagnóstico) ---
+@app.get("/debug/model-files")
+def debug_model_files():
+    from pathlib import Path
+    paths = [
+        "/tmp/modelo_llaves.onnx",
+        "/tmp/modelo_llaves.onnx.data",
+        "/tmp/labels.json",
+    ]
+    out = []
+    for p in paths:
+        pp = Path(p)
+        out.append({
+            "path": p,
+            "exists": pp.exists(),
+            "size": (pp.stat().st_size if pp.exists() else None),
+        })
+    return {"files": out}
+
+@app.get("/debug/env")
+def debug_env():
+    import os
+    keys = [
+        "MODEL_GCS", "MODEL_GCS_URI",
+        "MODEL_GCS_DATA_URI", "MODEL_DATA_GCS_URI",
+        "LABELS_GCS", "LABELS_GCS_URI",
+        "DEPLOY_STAMP",
+        "GUNICORN_TIMEOUT", "GUNICORN_GRACEFUL_TIMEOUT",
+    ]
+    return {k: os.getenv(k) for k in keys}
+
+
+# --- Debug bootstrap (forzar descarga) ---
+@app.post("/debug/bootstrap-now")
+def debug_bootstrap_now():
+    from model_bootstrap import ensure_model, MODEL_DST, DATA_DST, LABELS_DST
+    from pathlib import Path
+    err = None
+    ok = False
+    try:
+        ok = ensure_model()
+    except Exception as e:
+        err = f"{type(e).__name__}:{e}"
+
+    def stat(p):
+        pp = Path(p)
+        return {"path": p, "exists": pp.exists(), "size": (pp.stat().st_size if pp.exists() else None)}
+
+    return {
+        "ok": ok,
+        "err": err,
+        "files": [stat(MODEL_DST), stat(DATA_DST), stat(LABELS_DST)],
+    }
+

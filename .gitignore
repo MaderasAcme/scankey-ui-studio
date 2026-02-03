@@ -84,3 +84,6 @@ SCN_MOTOR_SHELL_DUMP_*.txt
 SCN_MOTOR_EXPORT_*.txt
 SCN_MOTOR_SHELL_DUMP_*.txt
 motor/*.bak_*
+out/
+megafactory/catalog/
+motor/catalog_runtime.json
