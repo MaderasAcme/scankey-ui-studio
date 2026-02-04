@@ -1,7 +1,15 @@
 import hashlib
 import re
 import os
-import catalog as _catalog
+# catalog es opcional: el motor NO debe caerse si falta
+try:
+    import catalog as _catalog  # /app/catalog.py
+except Exception:
+    try:
+        from motor import catalog as _catalog  # /app/motor/catalog.py
+    except Exception:
+        _catalog = None
+
 _catalog.load()
 import time
 import json

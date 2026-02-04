@@ -21,3 +21,4 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 ENV GUNICORN_TIMEOUT=300 GUNICORN_GRACEFUL_TIMEOUT=300
 CMD ["/app/start.sh"]
+COPY catalog.py /app/catalog.py
