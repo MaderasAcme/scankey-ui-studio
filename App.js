@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   View,
   Text,
@@ -10,7 +10,6 @@ import {
   Image,
   Alert,
   TextInput,
-  ActivityIndicator,
 } from "react-native";
 
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
@@ -20,21 +19,15 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 // =====================
 const MOD_ASYNC = "@react-native-async-storage/async-storage";
 const MOD_PICKER = "expo-image-picker";
+const MOD_MANIP = "expo-image-manipulator";
 
 function safeRequire(id) {
   try {
-    if (id === MOD_ASYNC) return require("@react-native-async-storage/async-storage");
-    if (id === MOD_PICKER) return require("expo-image-picker");
-    if (id === "@react-navigation/native") return require("@react-navigation/native");
-    if (id === "@react-navigation/bottom-tabs") return require("@react-navigation/bottom-tabs");
-    if (id === "@react-navigation/native-stack") return require("@react-navigation/native-stack");
-    return null;
+    return require(id);
   } catch (e) {
     return null;
   }
 }
-
-
 
 let AsyncStorage = null;
 try {
@@ -46,6 +39,11 @@ try {
 
 async function getImagePicker() {
   const mod = safeRequire(MOD_PICKER);
+  return mod?.default ?? mod ?? null;
+}
+
+function getImageManipulator() {
+  const mod = safeRequire(MOD_MANIP);
   return mod?.default ?? mod ?? null;
 }
 
@@ -69,20 +67,23 @@ const COLORS = {
   success: "#20C997",
 };
 
-const STORAGE_KEY = "scankey_demo_history_v1";
+const STORAGE_KEY = "scankey_demo_history_v2"; // v2 (sin fotos)
 const STORAGE_KEY_PENDING_FEEDBACK = "scankey_pending_feedback_v1";
 
 // =====================
 // Cloud Run endpoints (REAL)
+// - Puedes sobreescribir con EXPO_PUBLIC_MOTOR_BASE
 // =====================
-// ✅ CAMBIA SOLO ESTO SI TU URL ES OTRA
-const MOTOR_BASE = "https://classify-llaves-578907855193.europe-southwest1.run.app";
+const MOTOR_BASE =
+  (typeof process !== "undefined" &&
+    process?.env &&
+    process.env.EXPO_PUBLIC_MOTOR_BASE) ||
+  "https://classify-llaves-2apb4vvlhq-ew.a.run.app";
 const API_ANALYZE = `${MOTOR_BASE}/api/analyze-key`;
 const API_FEEDBACK = `${MOTOR_BASE}/api/feedback`;
-const API_HEALTH = `${MOTOR_BASE}/health`;
 
 // =====================
-// Storage helpers
+// Storage helpers (no fotos persistidas)
 // =====================
 const MemStore = { history: [], pendingFeedback: [] };
 
@@ -136,13 +137,6 @@ function nowId() {
   return `scan-${Date.now()}`;
 }
 
-function parseModelTitle(title) {
-  if (!title || typeof title !== "string") return { brand: null, model: null };
-  const parts = title.trim().split(/\s+/);
-  if (parts.length === 1) return { brand: null, model: parts[0] };
-  return { brand: parts[0] || null, model: parts.slice(1).join(" ") || null };
-}
-
 function isWeb() {
   return Platform.OS === "web";
 }
@@ -168,18 +162,33 @@ function assertPicker(ImagePicker) {
 function showMissingPickerHelp() {
   safeAlert(
     "Falta expo-image-picker",
-    "Snack NO puede instalarlo desde el código.\n\nSolución:\n1) En Snack abre el menú (⋮)\n2) Busca 'Dependencies'\n3) Añade: expo-image-picker\n4) Recarga.\n\nSi no te aparece 'Dependencies', crea un Snack nuevo y pega el App.js."
+    "Snack NO puede instalarlo desde el código.\n\nSolución:\n1) En Snack abre el menú (⋮)\n2) 'Dependencies'\n3) Añade: expo-image-picker\n4) Recarga."
   );
 }
 
+function clamp01(n) {
+  const x = typeof n === "number" ? n : Number(n);
+  if (!isFinite(x)) return 0;
+  return Math.max(0, Math.min(1, x));
+}
+
+function parseModelParts(r) {
+  const brand = r?.brand ?? r?.marca ?? null;
+  const model = r?.model ?? r?.modelo ?? null;
+  if (brand || model) return { brand: brand || null, model: model || null };
+
+  const title = r?.title ?? r?.label ?? r?.name ?? r?.model_name ?? "";
+  const s = String(title || "").trim();
+  if (!s) return { brand: null, model: null };
+  const parts = s.split(/\s+/);
+  if (parts.length === 1) return { brand: null, model: parts[0] };
+  return { brand: parts[0] || null, model: parts.slice(1).join(" ") || null };
+}
+
 // =====================
-// Network hardening: timeout + retry + safe json
+// Network hardening: AbortController + timeout real
 // =====================
 const DEFAULT_TIMEOUT_MS = 12000;
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 function safeJsonParse(text) {
   try {
@@ -189,7 +198,11 @@ function safeJsonParse(text) {
   }
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+async function fetchWithTimeout(
+  url,
+  options = {},
+  timeoutMs = DEFAULT_TIMEOUT_MS
+) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -199,58 +212,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_M
   }
 }
 
-/**
- * Devuelve { data, attempt, rawText }
- */
-async function fetchJsonWithRetry(
-  url,
-  options,
-  { retries = 1, timeoutMs = DEFAULT_TIMEOUT_MS, onAttempt } = {}
-) {
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= retries + 1; attempt++) {
-    try {
-      if (typeof onAttempt === "function") onAttempt(attempt);
-      const res = await fetchWithTimeout(url, options, timeoutMs);
-      const rawText = await res.text();
-      const data = safeJsonParse(rawText);
-
-      if (!res.ok) {
-        const msg = data?.detail || data?.error || rawText || `HTTP ${res.status}`;
-        throw new Error(msg);
-      }
-      if (!data || typeof data !== "object") {
-        throw new Error("Respuesta inválida (no JSON).");
-      }
-
-      return { data, attempt, rawText };
-    } catch (e) {
-      lastErr = e;
-      if (attempt <= retries) await sleep(450 * attempt);
-    }
-  }
-
-  throw lastErr || new Error("Fallo desconocido.");
-}
-
 // =====================
-// HEALTH check (Cloud Run)
-// =====================
-async function fetchHealth() {
-  const { data } = await fetchJsonWithRetry(
-    API_HEALTH,
-    { method: "GET", headers: { Accept: "application/json" } },
-    { retries: 0, timeoutMs: 8000 }
-  );
-  return data;
-}
-
-// =====================
-// REAL ANALYZE: send 2 images to Cloud Run (robusto)
-// - En mobile: usar { uri, name, type } (NO blob)
-// - En web: convertir a Blob
-// - Enviar duplicado con varios nombres de campo para encajar con el backend
+// Upload helpers (FormData robusto)
 // =====================
 async function uriToBlob(uri) {
   const r = await fetch(uri);
@@ -277,10 +240,161 @@ async function appendFileToFormData(fd, fieldName, uri, filename) {
   });
 }
 
-function normalizeAnalysis(raw, frontUri) {
+// =====================
+// Preprocess: resize/compresión + fallback automático
+// - Intento 1/2: comprimida
+// - Intento 2/2: original
+// =====================
+function getSizeNative(uri) {
+  return new Promise((resolve) => {
+    Image.getSize(
+      uri,
+      (w, h) => resolve({ w, h }),
+      () => resolve(null)
+    );
+  });
+}
+
+function getSizeWeb(uri) {
+  return new Promise((resolve) => {
+    try {
+      const img = new global.Image();
+      img.onload = () =>
+        resolve({
+          w: img.naturalWidth || img.width,
+          h: img.naturalHeight || img.height,
+        });
+      img.onerror = () => resolve(null);
+      img.src = uri;
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+async function getImageSize(uri) {
+  if (!uri) return null;
+  if (isWeb()) return await getSizeWeb(uri);
+  return await getSizeNative(uri);
+}
+
+async function preprocessWebImage(
+  uri,
+  { maxSide = 1280, quality = 0.85 } = {}
+) {
+  try {
+    const blob = await uriToBlob(uri);
+    const bmp = await createImageBitmap(blob);
+
+    let w = bmp.width;
+    let h = bmp.height;
+    const longSide = Math.max(w, h);
+    const scale = longSide > maxSide ? maxSide / longSide : 1;
+
+    const tw = Math.round(w * scale);
+    const th = Math.round(h * scale);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = tw;
+    canvas.height = th;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bmp, 0, 0, tw, th);
+
+    const outBlob = await new Promise((resolve) => {
+      canvas.toBlob((b) => resolve(b), "image/jpeg", quality);
+    });
+
+    if (!outBlob) return { uri, cleanup: [] };
+    const outUrl = URL.createObjectURL(outBlob);
+    return { uri: outUrl, cleanup: [outUrl] };
+  } catch (e) {
+    return { uri, cleanup: [] };
+  }
+}
+
+async function preprocessNativeImage(
+  uri,
+  { maxSide = 1280, quality = 0.85 } = {}
+) {
+  const IM = getImageManipulator();
+  if (!IM?.manipulateAsync) return { uri, cleanup: [] };
+
+  const size = await getImageSize(uri);
+  if (!size?.w || !size?.h) {
+    try {
+      const out = await IM.manipulateAsync(uri, [], {
+        compress: quality,
+        format: IM.SaveFormat?.JPEG || "jpeg",
+      });
+      return { uri: out?.uri || uri, cleanup: [] };
+    } catch (e) {
+      return { uri, cleanup: [] };
+    }
+  }
+
+  const { w, h } = size;
+  const longSide = Math.max(w, h);
+  if (longSide <= maxSide) {
+    try {
+      const out = await IM.manipulateAsync(uri, [], {
+        compress: quality,
+        format: IM.SaveFormat?.JPEG || "jpeg",
+      });
+      return { uri: out?.uri || uri, cleanup: [] };
+    } catch (e) {
+      return { uri, cleanup: [] };
+    }
+  }
+
+  const resize =
+    w >= h ? { resize: { width: maxSide } } : { resize: { height: maxSide } };
+
+  try {
+    const out = await IM.manipulateAsync(uri, [resize], {
+      compress: quality,
+      format: IM.SaveFormat?.JPEG || "jpeg",
+    });
+    return { uri: out?.uri || uri, cleanup: [] };
+  } catch (e) {
+    return { uri, cleanup: [] };
+  }
+}
+
+async function preprocessForUpload(uri) {
+  if (!uri) return { uri, cleanup: [] };
+  if (isWeb())
+    return await preprocessWebImage(uri, { maxSide: 1280, quality: 0.85 });
+  return await preprocessNativeImage(uri, { maxSide: 1280, quality: 0.85 });
+}
+
+// =====================
+// Engine JSON normalizer (soporta el spec + variantes)
+// =====================
+const _normCache = new Map();
+
+function normalizeEngineResponse(raw) {
   const data = raw && typeof raw === "object" ? raw : {};
-  const processed_ms = data.processed_ms ?? data.ms ?? data.latency_ms ?? 0;
+  const cacheKey = data.input_id || data.request_id || data.id || null;
+  if (cacheKey && _normCache.has(cacheKey)) return _normCache.get(cacheKey);
+
   const input_id = data.input_id ?? data.request_id ?? data.id ?? null;
+  const timestamp = data.timestamp || new Date().toISOString();
+
+  const manufacturer_hint = (() => {
+    const mh = data.manufacturer_hint || data.fabricante_hint || null;
+    if (mh && typeof mh === "object") {
+      return {
+        found: !!mh.found,
+        name: mh.name ?? null,
+        confidence: clamp01(mh.confidence ?? mh.score ?? 0),
+      };
+    }
+    const name = data.manufacturer || data.fabricante || null;
+    const conf = clamp01(
+      data.manufacturer_confidence ?? data.fabricante_confidence ?? 0
+    );
+    return { found: !!name && conf > 0, name: name || null, confidence: conf };
+  })();
 
   const list =
     (Array.isArray(data.results) && data.results) ||
@@ -288,75 +402,174 @@ function normalizeAnalysis(raw, frontUri) {
     (Array.isArray(data.predictions) && data.predictions) ||
     [];
 
-  const results = list
+  const mapped = list
     .map((r) => {
-      const title = r.title ?? r.label ?? r.model ?? r.name ?? "Modelo";
-      const confidenceRaw =
+      const confidence = clamp01(
         r.confidence ??
-        r.score ??
-        r.prob ??
-        r.probability ??
-        r.similarity ??
-        0;
+          r.score ??
+          r.prob ??
+          r.probability ??
+          r.similarity ??
+          0
+      );
 
-      const confidence =
-        typeof confidenceRaw === "number"
-          ? confidenceRaw
-          : Number(confidenceRaw) || 0;
+      const parts = parseModelParts(r);
+      const type = r.type ?? r.tipo ?? null;
+
+      const head_color =
+        r.head_color ?? r.headColor ?? r.color_cabezal ?? r.headcolor ?? null;
+
+      const visual_state =
+        r.visual_state ?? r.state ?? r.condition ?? r.estado ?? null;
+
+      const explain_text =
+        r.explain_text ?? r.explain ?? r.reason ?? r.explicacion ?? "";
+
+      const patentada = !!(r.patentada ?? r.patent ?? r.is_patented);
+
+      const compatibility_tags =
+        (Array.isArray(r.compatibility_tags) && r.compatibility_tags) ||
+        (Array.isArray(r.tags) && r.tags) ||
+        [];
+
+      const crop_bbox = r.crop_bbox ?? r.cropBbox ?? r.bbox ?? r.crop ?? null;
 
       return {
         rank: r.rank ?? null,
-        title,
         id_model_ref: r.id_model_ref ?? r.model_id ?? r.id ?? r.ref ?? null,
-        orientation: r.orientation ?? r.orientacion ?? "—",
-        headColor: r.headColor ?? r.head_color ?? r.color_cabezal ?? "—",
-        state: r.state ?? r.condition ?? r.estado ?? "—",
-        tags: Array.isArray(r.tags) ? r.tags : [],
+        type: type || null,
+        brand: parts.brand,
+        model: parts.model,
+        orientation: r.orientation ?? r.orientacion ?? null,
+        head_color: head_color || null,
+        visual_state: visual_state || null,
+        patentada,
+        compatibility_tags,
         confidence,
-        explain: r.explain ?? r.reason ?? r.explicacion ?? "",
-        patent: !!(r.patent ?? r.is_patented ?? r.patentada),
+        explain_text: String(explain_text || ""),
+        crop_bbox:
+          crop_bbox && typeof crop_bbox === "object"
+            ? {
+                x: Number(crop_bbox.x) || 0,
+                y: Number(crop_bbox.y) || 0,
+                w: Number(crop_bbox.w) || 0,
+                h: Number(crop_bbox.h) || 0,
+              }
+            : null,
       };
     })
-    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
-    .map((r, idx) => ({ ...r, rank: idx + 1 }));
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
 
-  return {
+  const results = mapped.slice(0, 3).map((r, idx) => ({ ...r, rank: idx + 1 }));
+  while (results.length < 3) {
+    results.push({
+      rank: results.length + 1,
+      id_model_ref: null,
+      type: null,
+      brand: null,
+      model: null,
+      orientation: null,
+      head_color: null,
+      visual_state: null,
+      patentada: false,
+      compatibility_tags: [],
+      confidence: 0,
+      explain_text: "",
+      crop_bbox: null,
+    });
+  }
+
+  const top = results[0] || null;
+  const topConf = clamp01(top?.confidence || 0);
+
+  const high_confidence =
+    typeof data.high_confidence === "boolean" ? data.high_confidence : topConf >= 0.95;
+
+  const low_confidence =
+    typeof data.low_confidence === "boolean" ? data.low_confidence : topConf < 0.60;
+
+  const should_store_sample =
+    typeof data.should_store_sample === "boolean" ? data.should_store_sample : false;
+
+  const storage_probability =
+    typeof data.storage_probability === "number" ? data.storage_probability : 0.75;
+
+  const current_samples_for_candidate =
+    typeof data.current_samples_for_candidate === "number"
+      ? data.current_samples_for_candidate
+      : 0;
+
+  const manual_correction_hint =
+    data.manual_correction_hint && typeof data.manual_correction_hint === "object"
+      ? data.manual_correction_hint
+      : { fields: ["marca", "modelo", "tipo", "orientacion", "ocr_text"] };
+
+  const debug = (() => {
+    const d = data.debug && typeof data.debug === "object" ? data.debug : {};
+    const processing_time_ms =
+      d.processing_time_ms ?? data.processing_time_ms ?? data.processed_ms ?? data.ms ?? 0;
+
+    const model_version = d.model_version ?? data.model_version ?? null;
+    return {
+      processing_time_ms: Number(processing_time_ms) || 0,
+      model_version: model_version ? String(model_version) : null,
+    };
+  })();
+
+  const normalized = {
     input_id,
-    processed_ms,
-    scanned_image: frontUri || data.scanned_image || null,
-    manufacturer_hint: data.manufacturer_hint ?? data.manufacturerHint ?? null,
-    high_confidence: !!(data.high_confidence ?? data.highConfidence),
-    low_confidence: !!(data.low_confidence ?? data.lowConfidence),
-    should_store_sample: !!(data.should_store_sample ?? data.shouldStoreSample),
-    current_samples_for_candidate:
-      data.current_samples_for_candidate ?? data.currentSamplesForCandidate ?? null,
+    timestamp,
+    manufacturer_hint,
     results,
+    low_confidence,
+    high_confidence,
+    should_store_sample,
+    storage_probability,
+    current_samples_for_candidate,
+    manual_correction_hint,
+    debug,
   };
+
+  if (cacheKey) _normCache.set(cacheKey, normalized);
+  return normalized;
 }
 
-// ✅ timeout+retry y devuelve _attempt
-async function postAnalyzeReal(frontUri, backUri, modoTaller, onAttempt) {
+// =====================
+// Analyze POST (1 intento, sin retry interno)
+// =====================
+async function postAnalyzeOnce(frontUri, backUri, modoTaller, { timeoutMs = 12000 } = {}) {
   const fd = new FormData();
 
   await appendFileToFormData(fd, "front", frontUri, "front.jpg");
-  if (backUri) await appendFileToFormData(fd, "back", backUri, "back.jpg");
+  await appendFileToFormData(fd, "back", backUri, "back.jpg");
   await appendFileToFormData(fd, "image_front", frontUri, "front.jpg");
-  if (backUri) await appendFileToFormData(fd, "image_back", backUri, "back.jpg");
+  await appendFileToFormData(fd, "image_back", backUri, "back.jpg");
+
   fd.append("source", "app");
   fd.append("modo_taller", String(!!modoTaller));
 
-  const { data, attempt } = await fetchJsonWithRetry(
+  const res = await fetchWithTimeout(
     API_ANALYZE,
     {
       method: "POST",
       headers: { Accept: "application/json" },
       body: fd,
     },
-    { retries: 1, timeoutMs: 12000, onAttempt } // total 2 intentos
+    timeoutMs
   );
 
-  const normalized = normalizeAnalysis(data, frontUri);
-  return { ...normalized, _attempt: attempt };
+  const rawText = await res.text().catch(() => "");
+  const data = safeJsonParse(rawText);
+
+  if (!res.ok) {
+    const msg = data?.detail || data?.error || rawText || `HTTP ${res.status}`;
+    throw new Error(String(msg));
+  }
+  if (!data || typeof data !== "object") {
+    throw new Error("Respuesta inválida (no JSON).");
+  }
+
+  return normalizeEngineResponse(data);
 }
 
 // =====================
@@ -378,10 +591,10 @@ async function postFeedback(payload) {
 
 async function queueFeedback(payload) {
   const list = await loadPendingFeedback();
-  const next = [
-    { id: String(Date.now()), createdAt: Date.now(), payload },
-    ...list,
-  ];
+  const next = [{ id: String(Date.now()), createdAt: Date.now(), payload }, ...list];
+  await savePendingFeedback(next);
+  return next.length;
+}
 
 async function flushPendingFeedback() {
   const list = await loadPendingFeedback();
@@ -404,7 +617,7 @@ async function flushPendingFeedback() {
 }
 
 // =====================
-// Small UI primitives
+// UI primitives
 // =====================
 function Screen({ children }) {
   return (
@@ -431,8 +644,8 @@ function TopTitle({ title, left, right }) {
           flex: 1,
           textAlign: "center",
           color: COLORS.text,
-          fontSize: 26,
-          fontWeight: "800",
+          fontSize: 24,
+          fontWeight: "900",
         }}
       >
         {title}
@@ -493,26 +706,14 @@ function PrimaryButton({ title, icon, onPress, style, textStyle, disabled }) {
       ]}
     >
       {icon}
-      <Text
-        style={[
-          { color: "#fff", fontWeight: "800", fontSize: 16 },
-          textStyle,
-        ]}
-      >
+      <Text style={[{ color: "#fff", fontWeight: "900", fontSize: 16 }, textStyle]}>
         {title}
       </Text>
     </TouchableOpacity>
   );
 }
 
-function OutlineButton({
-  title,
-  icon,
-  color = COLORS.accent,
-  onPress,
-  style,
-  disabled,
-}) {
+function OutlineButton({ title, icon, color = COLORS.accent, onPress, style, disabled }) {
   return (
     <TouchableOpacity
       activeOpacity={0.85}
@@ -536,26 +737,8 @@ function OutlineButton({
       ]}
     >
       {icon}
-      <Text style={{ color, fontWeight: "800", fontSize: 15 }}>{title}</Text>
+      <Text style={{ color, fontWeight: "900", fontSize: 15 }}>{title}</Text>
     </TouchableOpacity>
-  );
-}
-
-function SmallPill({ text, bg = "rgba(47,136,255,0.18)", fg = COLORS.accent }) {
-  return (
-    <View
-      style={{
-        paddingHorizontal: 10,
-        paddingVertical: 5,
-        borderRadius: 999,
-        backgroundColor: bg,
-        borderWidth: 1,
-        borderColor: "rgba(255,255,255,0.06)",
-        alignSelf: "flex-start",
-      }}
-    >
-      <Text style={{ color: fg, fontWeight: "900", fontSize: 12 }}>{text}</Text>
-    </View>
   );
 }
 
@@ -564,6 +747,8 @@ function Tag({ text, tone = "neutral" }) {
     neutral: { bg: "rgba(255,255,255,0.07)", fg: COLORS.textSoft },
     accent: { bg: "rgba(47,136,255,0.16)", fg: COLORS.accent },
     warning: { bg: "rgba(255,176,32,0.16)", fg: COLORS.warning },
+    success: { bg: "rgba(32,201,151,0.16)", fg: COLORS.success },
+    danger: { bg: "rgba(255,80,80,0.16)", fg: COLORS.danger },
   };
   const t = map[tone] || map.neutral;
   return (
@@ -579,9 +764,167 @@ function Tag({ text, tone = "neutral" }) {
         marginTop: 8,
       }}
     >
-      <Text style={{ color: t.fg, fontWeight: "800", fontSize: 12 }}>
-        {text}
+      <Text style={{ color: t.fg, fontWeight: "900", fontSize: 12 }}>{text}</Text>
+    </View>
+  );
+}
+
+function SmallPill({ text, tone = "accent" }) {
+  const map = {
+    accent: { bg: "rgba(47,136,255,0.18)", fg: COLORS.accent },
+    warning: { bg: "rgba(255,176,32,0.18)", fg: COLORS.warning },
+    success: { bg: "rgba(32,201,151,0.18)", fg: COLORS.success },
+    danger: { bg: "rgba(255,80,80,0.18)", fg: COLORS.danger },
+    neutral: { bg: "rgba(255,255,255,0.10)", fg: COLORS.textSoft },
+  };
+  const t = map[tone] || map.accent;
+  return (
+    <View
+      style={{
+        paddingHorizontal: 10,
+        paddingVertical: 5,
+        borderRadius: 999,
+        backgroundColor: t.bg,
+        borderWidth: 1,
+        borderColor: "rgba(255,255,255,0.06)",
+        alignSelf: "flex-start",
+      }}
+    >
+      <Text style={{ color: t.fg, fontWeight: "900", fontSize: 12 }}>{text}</Text>
+    </View>
+  );
+}
+
+function ConfidenceMeter({ confidence }) {
+  const c = clamp01(confidence);
+  const pct = Math.round(c * 100);
+
+  let title = "Confianza baja";
+  let icon = "close-circle-outline";
+  let color = COLORS.danger;
+
+  if (c >= 0.95) {
+    title = "Alta confianza";
+    icon = "checkmark-circle-outline";
+    color = COLORS.success;
+  } else if (c >= 0.60) {
+    title = "Confianza media";
+    icon = "alert-circle-outline";
+    color = COLORS.warning;
+  }
+
+  return (
+    <Card style={{ marginTop: 12 }}>
+      <Row style={{ justifyContent: "space-between" }}>
+        <Row style={{ gap: 10 }}>
+          <Ionicons name={icon} size={20} color={color} />
+          <Text style={{ color, fontWeight: "900", fontSize: 16 }}>{title}</Text>
+        </Row>
+        <Text style={{ color, fontWeight: "900", fontSize: 18 }}>{pct}%</Text>
+      </Row>
+
+      <View
+        style={{
+          height: 10,
+          borderRadius: 999,
+          backgroundColor: "rgba(255,255,255,0.08)",
+          marginTop: 12,
+          overflow: "hidden",
+        }}
+      >
+        <View style={{ height: 10, width: `${pct}%`, backgroundColor: color }} />
+      </View>
+
+      <Text style={{ color: COLORS.textSoft, marginTop: 10 }}>
+        Nivel de certeza del análisis.
       </Text>
+    </Card>
+  );
+}
+
+function useImageNaturalSize(uri) {
+  const [size, setSize] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const s = await getImageSize(uri);
+      if (!alive) return;
+      setSize(s);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [uri]);
+
+  return size;
+}
+
+function CropPreview({ uri, crop_bbox, size, style }) {
+  if (!uri || !crop_bbox || !size?.w || !size?.h) {
+    return (
+      <View
+        style={[
+          {
+            width: 74,
+            height: 56,
+            borderRadius: 12,
+            overflow: "hidden",
+            backgroundColor: "rgba(255,255,255,0.06)",
+            borderWidth: 1,
+            borderColor: "rgba(255,255,255,0.08)",
+            alignItems: "center",
+            justifyContent: "center",
+          },
+          style,
+        ]}
+      >
+        <MaterialCommunityIcons name="key" size={22} color={COLORS.textSoft} />
+      </View>
+    );
+  }
+
+  const cw = 74;
+  const ch = 56;
+
+  const bx = clamp01(crop_bbox.x) * size.w;
+  const by = clamp01(crop_bbox.y) * size.h;
+  const bw = Math.max(1, clamp01(crop_bbox.w) * size.w);
+  const bh = Math.max(1, clamp01(crop_bbox.h) * size.h);
+
+  const scale = Math.max(cw / bw, ch / bh);
+  const dw = size.w * scale;
+  const dh = size.h * scale;
+
+  const left = -bx * scale;
+  const top = -by * scale;
+
+  return (
+    <View
+      style={[
+        {
+          width: cw,
+          height: ch,
+          borderRadius: 12,
+          overflow: "hidden",
+          backgroundColor: "#000",
+          borderWidth: 1,
+          borderColor: "rgba(255,255,255,0.10)",
+        },
+        style,
+      ]}
+    >
+      <Image
+        source={{ uri }}
+        style={{
+          position: "absolute",
+          width: dw,
+          height: dh,
+          left,
+          top,
+        }}
+        resizeMode="cover"
+      />
     </View>
   );
 }
@@ -590,36 +933,9 @@ function Tag({ text, tone = "neutral" }) {
 // Screens
 // =====================
 function HomeScreen({ go }) {
-  const [health, setHealth] = useState(null);
-  const [healthErr, setHealthErr] = useState(null);
-
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const h = await fetchHealth();
-        if (!alive) return;
-        setHealth(h);
-        setHealthErr(null);
-      } catch (e) {
-        if (!alive) return;
-        setHealth(null);
-        setHealthErr(e);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-  const engineLoaded = health?.engine_loaded ?? health?.engineLoaded;
-  const motorOk = !!health?.ok && (engineLoaded === undefined ? true : !!engineLoaded) && !healthErr;
-  const motorLabel = motorOk ? "Motor online" : "Motor offline";
-
   return (
     <Screen>
-      <ScrollView
-        contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 30 }}
-      >
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 30 }}>
         <Row style={{ justifyContent: "space-between", marginTop: 12 }}>
           <Row style={{ gap: 10 }}>
             <MaterialCommunityIcons name="key" size={22} color={COLORS.accent} />
@@ -646,11 +962,11 @@ function HomeScreen({ go }) {
           </TouchableOpacity>
         </Row>
 
-        <View style={{ alignItems: "center", marginTop: 40, marginBottom: 20 }}>
+        <View style={{ alignItems: "center", marginTop: 38, marginBottom: 18 }}>
           <View
             style={{
-              width: 90,
-              height: 90,
+              width: 92,
+              height: 92,
               borderRadius: 999,
               backgroundColor: "rgba(47,136,255,0.08)",
               borderWidth: 1,
@@ -684,8 +1000,7 @@ function HomeScreen({ go }) {
             lineHeight: 22,
           }}
         >
-          Toma dos fotos — lado A y lado B — y te mostraremos{"\n"}los 3 modelos
-          más parecidos.
+          Haz 2 fotos (lado A y lado B). Recibirás{"\n"}TOP 3 candidatos con explicación.
         </Text>
 
         <PrimaryButton
@@ -697,66 +1012,19 @@ function HomeScreen({ go }) {
 
         <Row style={{ gap: 12, marginTop: 14 }}>
           <QuickCard title="Historial" icon="time-outline" onPress={() => go("History")} />
-          <QuickCard title="Mis talleres" icon="hammer-outline" onPress={() => go("Taller")} />
-          <QuickCard title="Guía de captura" icon="book-outline" onPress={() => go("Guide")} />
+          <QuickCard title="Taller" icon="hammer-outline" onPress={() => go("Taller")} />
+          <QuickCard title="Guía" icon="book-outline" onPress={() => go("Guide")} />
         </Row>
-
-        <View style={{ alignItems: "center", marginTop: 16 }}>
-          <Row
-            style={{
-              paddingHorizontal: 14,
-              paddingVertical: 8,
-              borderRadius: 999,
-              backgroundColor: "rgba(255,255,255,0.06)",
-              borderWidth: 1,
-              borderColor: "rgba(255,255,255,0.08)",
-              gap: 10,
-            }}
-          >
-            <View
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: 999,
-                backgroundColor: motorOk ? COLORS.success : COLORS.danger,
-              }}
-            />
-            <Text style={{ color: motorOk ? COLORS.success : COLORS.danger, fontWeight: "900" }}>
-              {motorLabel}
-            </Text>
-            <TouchableOpacity
-              activeOpacity={0.85}
-              onPress={async () => {
-                try {
-                  const h = await fetchHealth();
-                  setHealth(h);
-                  setHealthErr(null);
-                } catch (e) {
-                  setHealth(null);
-                  setHealthErr(e);
-                }
-              }}
-            >
-              <Ionicons name="refresh-outline" size={18} color={COLORS.textSoft} />
-            </TouchableOpacity>
-          </Row>
-
-          {!motorOk && (healthErr?.message || health?.engine_error) ? (
-            <Text style={{ color: COLORS.textSoft, marginTop: 8, textAlign: "center" }}>
-              {String(healthErr?.message || health?.engine_error)}
-            </Text>
-          ) : null}
-        </View>
 
         <Text
           style={{
-            color: COLORS.textSoft,
+            color: "rgba(255,255,255,0.45)",
             textAlign: "center",
             marginTop: 18,
-            fontWeight: "700",
+            fontWeight: "800",
           }}
         >
-          Versión REAL — Motor en Cloud Run
+          Motor REAL en Cloud Run
         </Text>
       </ScrollView>
     </Screen>
@@ -780,32 +1048,10 @@ function QuickCard({ title, icon, onPress }) {
       }}
     >
       <Ionicons name={icon} size={20} color={COLORS.accent} />
-      <Text style={{ color: COLORS.textSoft, fontWeight: "800", textAlign: "center" }}>
+      <Text style={{ color: COLORS.textSoft, fontWeight: "900", textAlign: "center" }}>
         {title}
       </Text>
     </TouchableOpacity>
-  );
-}
-
-function Placeholder({ title, goBack }) {
-  return (
-    <Screen>
-      <TopTitle
-        title={title}
-        left={
-          <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
-            <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
-          </TouchableOpacity>
-        }
-      />
-      <View style={{ paddingHorizontal: 18 }}>
-        <Card>
-          <Text style={{ color: COLORS.textSoft }}>
-            Pantalla placeholder (la dejamos lista para luego).
-          </Text>
-        </Card>
-      </View>
-    </Screen>
   );
 }
 
@@ -831,7 +1077,11 @@ function PhotoBlock({ title, hint, uri, onCamera, onGallery, onClear }) {
         }}
       >
         {uri ? (
-          <Image source={{ uri }} style={{ width: "100%", height: "100%" }} resizeMode="cover" />
+          <Image
+            source={{ uri }}
+            style={{ width: "100%", height: "100%" }}
+            resizeMode="cover"
+          />
         ) : (
           <Row style={{ gap: 12 }}>
             <PrimaryButton
@@ -857,9 +1107,7 @@ function PhotoBlock({ title, hint, uri, onCamera, onGallery, onClear }) {
               }}
             >
               <Ionicons name="images-outline" size={18} color={COLORS.textSoft} />
-              <Text style={{ fontWeight: "900", color: COLORS.textSoft }}>
-                Galería
-              </Text>
+              <Text style={{ fontWeight: "900", color: COLORS.textSoft }}>Galería</Text>
             </TouchableOpacity>
           </Row>
         )}
@@ -953,7 +1201,7 @@ function ScanScreen({ goBack, go, setScanDraft, onResetScanDraft }) {
     }
 
     const result = await ImagePicker.launchCameraAsync({
-      quality: 0.9,
+      quality: 1,
       allowsEditing: false,
     });
 
@@ -985,7 +1233,7 @@ function ScanScreen({ goBack, go, setScanDraft, onResetScanDraft }) {
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions?.Images,
-      quality: 0.9,
+      quality: 1,
     });
 
     if (result.canceled) return;
@@ -1001,30 +1249,55 @@ function ScanScreen({ goBack, go, setScanDraft, onResetScanDraft }) {
   const analyzeReal = async () => {
     if (!canAnalyze || loading) return;
 
+    let cleanup = [];
     try {
       setLoading(true);
-      setLoadingMsg("Analizando… intento 1/2");
+      setLoadingMsg("Intento 1/2");
 
-      const analysis = await postAnalyzeReal(frontUri, backUri, modoTaller, (attempt) => {
-        const a = Number(attempt) || 1;
-        setLoadingMsg(`Analizando… intento ${Math.min(2, Math.max(1, a))}/2`);
-      });
+      const pFront = await preprocessForUpload(frontUri);
+      const pBack = await preprocessForUpload(backUri);
+      cleanup = [...(pFront.cleanup || []), ...(pBack.cleanup || [])];
+
+      const analysis1 = await postAnalyzeOnce(pFront.uri, pBack.uri, modoTaller, { timeoutMs: 12000 });
 
       setScanDraft({
-        input_id: analysis?.input_id || nowId(),
+        input_id: analysis1?.input_id || nowId(),
+        createdAt: Date.now(),
         frontUri,
         backUri,
-        analysis,
-        createdAt: Date.now(),
         modoTaller,
+        analysis: analysis1,
       });
 
       go("Results");
-    } catch (e) {
-      safeAlert("Error analizando", String(e?.message || e));
+    } catch (e1) {
+      try {
+        setLoadingMsg("Intento 2/2");
+        const analysis2 = await postAnalyzeOnce(frontUri, backUri, modoTaller, { timeoutMs: 15000 });
+
+        setScanDraft({
+          input_id: analysis2?.input_id || nowId(),
+          createdAt: Date.now(),
+          frontUri,
+          backUri,
+          modoTaller,
+          analysis: analysis2,
+        });
+
+        go("Results");
+      } catch (e2) {
+        safeAlert("Error analizando", String(e2?.message || e2));
+      }
     } finally {
       setLoading(false);
       setLoadingMsg("");
+      if (isWeb() && cleanup.length) {
+        cleanup.forEach((u) => {
+          try {
+            URL.revokeObjectURL(u);
+          } catch (e) {}
+        });
+      }
     }
   };
 
@@ -1049,82 +1322,646 @@ function ScanScreen({ goBack, go, setScanDraft, onResetScanDraft }) {
             <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
           </TouchableOpacity>
         }
+        right={
+          <TouchableOpacity activeOpacity={0.85} onPress={() => go("Guide")}>
+            <Ionicons name="help-circle-outline" size={22} color={COLORS.accent} />
+          </TouchableOpacity>
+        }
+      />
+
+      {loading ? (
+        <View style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 18 }}>
+          <View
+            style={{
+              width: 86,
+              height: 86,
+              borderRadius: 24,
+              backgroundColor: "rgba(47,136,255,0.10)",
+              borderWidth: 1,
+              borderColor: "rgba(47,136,255,0.18)",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Ionicons name="sparkles-outline" size={34} color={COLORS.accent} />
+          </View>
+          <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 22, marginTop: 16 }}>
+            Analizando…
+          </Text>
+          <Text style={{ color: COLORS.textSoft, marginTop: 8, fontWeight: "800" }}>
+            {loadingMsg || "Intento 1/2"}
+          </Text>
+        </View>
+      ) : (
+        <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 26 }}>
+          <PhotoBlock
+            title="Foto Lado A"
+            hint="Fondo blanco mate, buena luz, llave centrada"
+            uri={frontUri}
+            onCamera={() => openCameraViaPicker("front")}
+            onGallery={() => pickFromGallery("front")}
+            onClear={() => setFrontUri(null)}
+          />
+
+          <PhotoBlock
+            title="Foto Lado B"
+            hint="Misma luz y fondo. Que se vea bien la punta y guías"
+            uri={backUri}
+            onCamera={() => openCameraViaPicker("back")}
+            onGallery={() => pickFromGallery("back")}
+            onClear={() => setBackUri(null)}
+          />
+
+          <Card style={{ marginTop: 14, paddingVertical: 14 }}>
+            <Row style={{ justifyContent: "space-between" }}>
+              <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 16 }}>
+                Modo Taller
+              </Text>
+              <Switch
+                value={modoTaller}
+                onValueChange={setModoTaller}
+                trackColor={{
+                  false: "rgba(255,255,255,0.12)",
+                  true: "rgba(47,136,255,0.35)",
+                }}
+                thumbColor={modoTaller ? COLORS.accent : "#9AA0A6"}
+              />
+            </Row>
+            <Text style={{ color: COLORS.textSoft, marginTop: 8 }}>
+              Taller: más señales y flujo interno (sin guardar fotos en el móvil).
+            </Text>
+          </Card>
+
+          <OutlineButton
+            title="Cargar 2 fotos desde galería"
+            icon={<Ionicons name="images-outline" size={18} color={COLORS.accent} />}
+            onPress={async () => {
+              await pickFromGallery("front");
+              await pickFromGallery("back");
+            }}
+            style={{ marginTop: 14 }}
+          />
+
+          <PrimaryButton
+            title="Analizar (REAL)"
+            icon={<Ionicons name="sparkles-outline" size={18} color="#fff" />}
+            onPress={analyzeReal}
+            style={{ marginTop: 12 }}
+            disabled={!canAnalyze}
+          />
+
+          {!canAnalyze ? (
+            <Text style={{ color: COLORS.textSoft, marginTop: 10, textAlign: "center" }}>
+              Necesitas 2 fotos (lado A + lado B).
+            </Text>
+          ) : null}
+
+          {isWeb() ? (
+            <Text style={{ color: "rgba(255,255,255,0.45)", marginTop: 12, textAlign: "center" }}>
+              En Web: “Cámara” abre selector según navegador.
+            </Text>
+          ) : null}
+        </ScrollView>
+      )}
+    </Screen>
+  );
+}
+
+function CandidateCard({ rank, result, previewUri, previewSize, onPickCorrect, sending }) {
+  const confidence = clamp01(result?.confidence || 0);
+  const pct = Math.round(confidence * 100);
+
+  const icon =
+    rank === 1 ? "trophy-outline" : rank === 2 ? "medal-outline" : "ribbon-outline";
+
+  const brand = result?.brand || "—";
+  const model = result?.model || "";
+  const titleLine = brand === "—" ? "Modelo desconocido" : brand;
+  const subLine = model || "";
+
+  return (
+    <Card style={{ marginTop: 14, padding: 0, overflow: "hidden" }}>
+      <Row style={{ padding: 14, gap: 12 }}>
+        <CropPreview uri={previewUri} crop_bbox={result?.crop_bbox} size={previewSize} />
+
+        <View style={{ flex: 1 }}>
+          <Row style={{ gap: 10 }}>
+            <SmallPill text={`#${rank}`} />
+            <View style={{ marginLeft: 2 }}>
+              <Ionicons name={icon} size={16} color={COLORS.textSoft} />
+            </View>
+            {result?.patentada ? <Tag text="PATENTADA" tone="warning" /> : null}
+          </Row>
+
+          <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 18, marginTop: 8 }}>
+            {titleLine}
+          </Text>
+          {!!subLine ? (
+            <Text style={{ color: COLORS.textSoft, marginTop: 2, fontWeight: "800" }}>
+              {subLine}
+            </Text>
+          ) : null}
+
+          <Row style={{ flexWrap: "wrap", marginTop: 4 }}>
+            {result?.type ? <Tag text={String(result.type)} tone="accent" /> : null}
+            {result?.orientation ? <Tag text={`Orientación: ${result.orientation}`} /> : null}
+            {result?.head_color ? <Tag text={`Cabezal: ${result.head_color}`} /> : null}
+            {result?.visual_state ? <Tag text={`Estado: ${result.visual_state}`} /> : null}
+            {Array.isArray(result?.compatibility_tags)
+              ? result.compatibility_tags.slice(0, 3).map((t) => <Tag key={t} text={t} />)
+              : null}
+          </Row>
+
+          <View style={{ marginTop: 10 }}>
+            <Row style={{ justifyContent: "space-between" }}>
+              <Text style={{ color: COLORS.textSoft, fontWeight: "900" }}>Confianza</Text>
+              <Text style={{ color: COLORS.textSoft, fontWeight: "900" }}>{pct}%</Text>
+            </Row>
+            <View
+              style={{
+                height: 8,
+                borderRadius: 999,
+                backgroundColor: "rgba(255,255,255,0.08)",
+                marginTop: 8,
+                overflow: "hidden",
+              }}
+            >
+              <View style={{ height: 8, width: `${pct}%`, backgroundColor: COLORS.accent }} />
+            </View>
+          </View>
+
+          {!!result?.explain_text ? (
+            <Text style={{ color: COLORS.textSoft, marginTop: 10, fontStyle: "italic" }}>
+              "{result.explain_text}"
+            </Text>
+          ) : null}
+        </View>
+      </Row>
+
+      <View style={{ paddingHorizontal: 14, paddingBottom: 14 }}>
+        <PrimaryButton
+          title={sending ? "Enviando…" : "Esta es correcta"}
+          icon={<Ionicons name="checkmark-circle-outline" size={18} color="#fff" />}
+          onPress={onPickCorrect}
+          disabled={sending}
+          style={{ backgroundColor: "#19B36B" }}
+        />
+      </View>
+    </Card>
+  );
+}
+
+function ResultsScreen({ goBack, go, scanDraft, onSaveToHistory, onNewScan }) {
+  const analysis = scanDraft?.analysis || null;
+  const [sending, setSending] = useState(false);
+  const autoForcedRef = useRef(false);
+
+  const previewSize = useImageNaturalSize(scanDraft?.frontUri || null);
+
+  const results = useMemo(() => {
+    const r = analysis?.results;
+    return Array.isArray(r) ? r : [];
+  }, [analysis]);
+
+  const topConf = clamp01(results?.[0]?.confidence || 0);
+  const low = !!analysis?.low_confidence;
+  const high = !!analysis?.high_confidence;
+
+  useEffect(() => {
+    if (low && !autoForcedRef.current) {
+      autoForcedRef.current = true;
+      setTimeout(() => {
+        go("Manual");
+      }, 10);
+    }
+  }, [low, go]);
+
+  if (!analysis) {
+    return (
+      <Screen>
+        <TopTitle
+          title="Resultados"
+          left={
+            <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
+              <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+            </TouchableOpacity>
+          }
+        />
+        <View style={{ paddingHorizontal: 18 }}>
+          <Card>
+            <Text style={{ color: COLORS.textSoft }}>No hay análisis. Vuelve a Escanear.</Text>
+          </Card>
+        </View>
+      </Screen>
+    );
+  }
+
+  const sendFeedbackForCandidate = async (candidate) => {
+    if (sending) return;
+    setSending(true);
+    try {
+      const payload = {
+        input_id:
+          scanDraft?.input_id ||
+          analysis?.input_id ||
+          String(scanDraft?.createdAt || Date.now()),
+        chosen_id_model_ref: candidate?.id_model_ref || null,
+        source: "app_real",
+        ocr_text: null,
+        correct_brand: candidate?.brand || null,
+        correct_model: candidate?.model || null,
+        correct_type: candidate?.type || null,
+        correct_orientation: candidate?.orientation || null,
+      };
+      await postFeedback(payload);
+      safeAlert("OK", "Feedback enviado.");
+    } catch (e) {
+      const count = await queueFeedback({
+        input_id:
+          scanDraft?.input_id ||
+          analysis?.input_id ||
+          String(scanDraft?.createdAt || Date.now()),
+        chosen_id_model_ref: candidate?.id_model_ref || null,
+        source: "app_real_queued",
+        ocr_text: null,
+        correct_brand: candidate?.brand || null,
+        correct_model: candidate?.model || null,
+        correct_type: candidate?.type || null,
+        correct_orientation: candidate?.orientation || null,
+      });
+      safeAlert("Guardado", `Sin red. Feedback en cola.\nPendientes: ${count}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const acceptAndDuplicate = async () => {
+    const top = results?.[0] || null;
+    if (!top) return;
+    await sendFeedbackForCandidate(top);
+    if (!low) await onSaveToHistory?.();
+    onNewScan?.();
+  };
+
+  return (
+    <Screen>
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 140 }}>
+        <Row style={{ justifyContent: "space-between", marginTop: 12 }}>
+          <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
+            <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+          </TouchableOpacity>
+
+          <View style={{ flex: 1, alignItems: "center" }}>
+            <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 22 }}>Resultados</Text>
+            <Text style={{ color: COLORS.textSoft, marginTop: 4 }}>
+              {analysis?.debug?.processing_time_ms
+                ? `Procesado en ${analysis.debug.processing_time_ms}ms`
+                : "Motor REAL"}
+            </Text>
+          </View>
+
+          <TouchableOpacity activeOpacity={0.85} onPress={() => go("Guide")}>
+            <Ionicons name="information-circle-outline" size={22} color={COLORS.accent} />
+          </TouchableOpacity>
+        </Row>
+
+        <ConfidenceMeter confidence={topConf} />
+
+        {analysis?.manufacturer_hint?.found && analysis?.manufacturer_hint?.name ? (
+          <Card style={{ marginTop: 12 }}>
+            <Row style={{ justifyContent: "space-between" }}>
+              <Text style={{ color: COLORS.text, fontWeight: "900" }}>Fabricante detectado</Text>
+              <SmallPill
+                text={`${Math.round(clamp01(analysis.manufacturer_hint.confidence) * 100)}%`}
+                tone="accent"
+              />
+            </Row>
+            <Text style={{ color: COLORS.textSoft, marginTop: 8 }}>
+              {analysis.manufacturer_hint.name}
+            </Text>
+          </Card>
+        ) : null}
+
+        {low ? (
+          <Card style={{ marginTop: 12, borderColor: "rgba(255,176,32,0.35)" }}>
+            <Row style={{ gap: 10 }}>
+              <Ionicons name="alert-circle-outline" size={20} color={COLORS.warning} />
+              <Text style={{ color: COLORS.warning, fontWeight: "900", fontSize: 16 }}>
+                Resultado dudoso
+              </Text>
+            </Row>
+            <Text style={{ color: COLORS.textSoft, marginTop: 8 }}>
+              Debes usar <Text style={{ color: COLORS.text, fontWeight: "900" }}>Corregir manualmente</Text>.
+            </Text>
+          </Card>
+        ) : null}
+
+        <Card style={{ marginTop: 12, padding: 0, overflow: "hidden" }}>
+          <View
+            style={{
+              height: 160,
+              backgroundColor: "#000",
+              borderWidth: 2,
+              borderColor: "rgba(47,136,255,0.65)",
+              margin: 14,
+              borderRadius: 16,
+              overflow: "hidden",
+            }}
+          >
+            {scanDraft?.frontUri ? (
+              <Image source={{ uri: scanDraft.frontUri }} style={{ width: "100%", height: "100%" }} resizeMode="cover" />
+            ) : null}
+            <View style={{ position: "absolute", left: 12, top: 12 }}>
+              <SmallPill text="Llave escaneada" tone="accent" />
+            </View>
+          </View>
+        </Card>
+
+        {results.map((r, idx) => (
+          <CandidateCard
+            key={`${r.rank || idx}-${r.id_model_ref || "x"}`}
+            rank={r.rank || idx + 1}
+            result={r}
+            previewUri={scanDraft?.frontUri || null}
+            previewSize={previewSize}
+            sending={sending}
+            onPickCorrect={() => sendFeedbackForCandidate(r)}
+          />
+        ))}
+      </ScrollView>
+
+      <View
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          paddingHorizontal: 18,
+          paddingTop: 12,
+          paddingBottom: 14,
+          backgroundColor: COLORS.cardSoft,
+          borderTopWidth: 1,
+          borderTopColor: "rgba(255,255,255,0.08)",
+        }}
+      >
+        <Row style={{ gap: 12 }}>
+          <OutlineButton
+            title="Corregir manualmente"
+            icon={<Ionicons name="create-outline" size={18} color={COLORS.accent} />}
+            onPress={() => go("Manual")}
+            style={{ flex: 1 }}
+          />
+
+          {high ? (
+            <PrimaryButton
+              title="Aceptar y duplicar"
+              icon={<Ionicons name="copy-outline" size={18} color="#fff" />}
+              onPress={acceptAndDuplicate}
+              style={{ flex: 1 }}
+              disabled={sending}
+            />
+          ) : (
+            <PrimaryButton
+              title="Guardar en historial"
+              icon={<Ionicons name="bookmark-outline" size={18} color="#fff" />}
+              onPress={async () => {
+                if (low) {
+                  go("Manual");
+                  return;
+                }
+                await onSaveToHistory?.();
+              }}
+              style={{ flex: 1 }}
+              disabled={sending}
+            />
+          )}
+        </Row>
+
+        <OutlineButton
+          title="Nuevo escaneo"
+          icon={<Ionicons name="refresh-outline" size={18} color={COLORS.accent} />}
+          onPress={onNewScan}
+          style={{ marginTop: 10 }}
+          disabled={sending}
+        />
+      </View>
+    </Screen>
+  );
+}
+
+function ManualCorrectionScreen({ goBack, go, scanDraft }) {
+  const analysis = scanDraft?.analysis || null;
+  const [sending, setSending] = useState(false);
+
+  const [brand, setBrand] = useState("");
+  const [model, setModel] = useState("");
+  const [type, setType] = useState("");
+  const [orientation, setOrientation] = useState("");
+  const [ocrText, setOcrText] = useState("");
+
+  useEffect(() => {
+    const top = analysis?.results?.[0] || null;
+    if (!top) return;
+    setBrand((top.brand || "") + "");
+    setModel((top.model || "") + "");
+    setType((top.type || "") + "");
+    setOrientation((top.orientation || "") + "");
+  }, [analysis]);
+
+  if (!analysis) {
+    return (
+      <Screen>
+        <TopTitle
+          title="Corrección manual"
+          left={
+            <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
+              <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+            </TouchableOpacity>
+          }
+        />
+        <View style={{ paddingHorizontal: 18 }}>
+          <Card>
+            <Text style={{ color: COLORS.textSoft }}>No hay datos para corregir.</Text>
+          </Card>
+        </View>
+      </Screen>
+    );
+  }
+
+  const submit = async () => {
+    if (sending) return;
+    if (!brand.trim() || !model.trim()) {
+      safeAlert("Falta info", "Marca y modelo son obligatorios.");
+      return;
+    }
+
+    setSending(true);
+    try {
+      const payload = {
+        input_id:
+          scanDraft?.input_id ||
+          analysis?.input_id ||
+          String(scanDraft?.createdAt || Date.now()),
+        chosen_id_model_ref: null,
+        source: "app_manual",
+        ocr_text: ocrText ? String(ocrText) : null,
+        correct_brand: brand.trim(),
+        correct_model: model.trim(),
+        correct_type: type ? String(type) : null,
+        correct_orientation: orientation ? String(orientation) : null,
+      };
+
+      await postFeedback(payload);
+      safeAlert("OK", "Corrección enviada.");
+      goBack();
+    } catch (e) {
+      const count = await queueFeedback({
+        input_id:
+          scanDraft?.input_id ||
+          analysis?.input_id ||
+          String(scanDraft?.createdAt || Date.now()),
+        chosen_id_model_ref: null,
+        source: "app_manual_queued",
+        ocr_text: ocrText ? String(ocrText) : null,
+        correct_brand: brand.trim(),
+        correct_model: model.trim(),
+        correct_type: type ? String(type) : null,
+        correct_orientation: orientation ? String(orientation) : null,
+      });
+      safeAlert("Guardado", `Sin red. Corrección en cola.\nPendientes: ${count}`);
+      goBack();
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const pickFromCandidate = (r) => {
+    setBrand((r?.brand || "") + "");
+    setModel((r?.model || "") + "");
+    setType((r?.type || "") + "");
+    setOrientation((r?.orientation || "") + "");
+  };
+
+  return (
+    <Screen>
+      <TopTitle
+        title="Corrección manual"
+        left={
+          <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
+            <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+          </TouchableOpacity>
+        }
       />
 
       <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 26 }}>
-        <PhotoBlock
-          title="Foto Lado A (Izquierda)"
-          hint="Punta hacia la izquierda, fondo blanco"
-          uri={frontUri}
-          onCamera={() => openCameraViaPicker("front")}
-          onGallery={() => pickFromGallery("front")}
-          onClear={() => setFrontUri(null)}
-        />
-
-        <PhotoBlock
-          title="Foto Lado B (Derecha)"
-          hint="Punta hacia la derecha, mismo fondo e iluminación"
-          uri={backUri}
-          onCamera={() => openCameraViaPicker("back")}
-          onGallery={() => pickFromGallery("back")}
-          onClear={() => setBackUri(null)}
-        />
-
-        <Card style={{ marginTop: 14, paddingVertical: 14 }}>
-          <Row style={{ justifyContent: "space-between" }}>
+        <Card style={{ padding: 0, overflow: "hidden" }}>
+          <View style={{ height: 160, backgroundColor: "#000" }}>
+            {scanDraft?.frontUri ? (
+              <Image
+                source={{ uri: scanDraft.frontUri }}
+                style={{ width: "100%", height: "100%" }}
+                resizeMode="cover"
+              />
+            ) : null}
+          </View>
+          <View style={{ padding: 14 }}>
             <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 16 }}>
-              Modo Taller
+              Rellena lo que sabes (mínimo marca + modelo)
             </Text>
-            <Switch
-              value={modoTaller}
-              onValueChange={setModoTaller}
-              trackColor={{
-                false: "rgba(255,255,255,0.12)",
-                true: "rgba(47,136,255,0.35)",
-              }}
-              thumbColor={modoTaller ? COLORS.accent : "#9AA0A6"}
-            />
+            <Text style={{ color: COLORS.textSoft, marginTop: 6 }}>
+              Esto ayuda a entrenar y mejorar el motor.
+            </Text>
+          </View>
+        </Card>
+
+        <Card style={{ marginTop: 14 }}>
+          <Text style={{ color: COLORS.textSoft, fontWeight: "900", fontSize: 12, letterSpacing: 1 }}>
+            SUGERENCIAS (TOP 3)
+          </Text>
+          <Row style={{ flexWrap: "wrap", marginTop: 8 }}>
+            {(analysis?.results || []).map((r, i) => {
+              const label = `${r?.brand || "—"} ${r?.model || ""}`.trim();
+              return (
+                <TouchableOpacity
+                  key={`${i}-${r?.id_model_ref || "x"}`}
+                  activeOpacity={0.85}
+                  onPress={() => pickFromCandidate(r)}
+                  style={{
+                    paddingHorizontal: 10,
+                    paddingVertical: 8,
+                    borderRadius: 999,
+                    backgroundColor: "rgba(255,255,255,0.06)",
+                    borderWidth: 1,
+                    borderColor: "rgba(255,255,255,0.08)",
+                    marginRight: 8,
+                    marginTop: 8,
+                  }}
+                >
+                  <Text style={{ color: COLORS.textSoft, fontWeight: "900" }}>
+                    {label || "—"}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
           </Row>
         </Card>
 
-        <OutlineButton
-          title="Subir fotos desde galería"
-          icon={<Ionicons name="images-outline" size={18} color={COLORS.accent} />}
-          onPress={async () => {
-            await pickFromGallery("front");
-            await pickFromGallery("back");
-          }}
-          style={{ marginTop: 14 }}
-          disabled={loading}
-        />
+        <Card style={{ marginTop: 14 }}>
+          <Field label="Marca *" value={brand} setValue={setBrand} placeholder="Ej: TESA, JMA, CISA…" />
+          <Field label="Modelo *" value={model} setValue={setModel} placeholder="Ej: TE8I, TE5D…" />
+          <Field label="Tipo" value={type} setValue={setType} placeholder="Ej: plana, dimple…" />
+          <Field label="Orientación" value={orientation} setValue={setOrientation} placeholder="Ej: izquierda/derecha/simétrica" />
+          <Field label="Texto cabezal (OCR)" value={ocrText} setValue={setOcrText} placeholder="Ej: TE8I, JMA…" />
+        </Card>
 
         <PrimaryButton
-          title={loading ? (loadingMsg || "Analizando…") : "Analizar (REAL)"}
-          icon={<Ionicons name="sparkles-outline" size={18} color="#fff" />}
-          onPress={analyzeReal}
-          style={{ marginTop: 12 }}
-          disabled={!canAnalyze || loading}
+          title={sending ? "Enviando…" : "Enviar corrección"}
+          icon={<Ionicons name="send-outline" size={18} color="#fff" />}
+          onPress={submit}
+          style={{ marginTop: 14 }}
+          disabled={sending}
         />
 
-        {!canAnalyze ? (
-          <Text style={{ color: COLORS.textSoft, marginTop: 10, textAlign: "center" }}>
-            Necesitas 2 fotos (lado A + lado B) para analizar.
-          </Text>
-        ) : null}
-
-        {isWeb() ? (
-          <Text style={{ color: "rgba(255,255,255,0.45)", marginTop: 12, textAlign: "center" }}>
-            En Web: el botón Cámara abre el selector (según navegador).
-          </Text>
-        ) : null}
+        <OutlineButton
+          title="Volver a resultados"
+          icon={<Ionicons name="arrow-back-outline" size={18} color={COLORS.accent} />}
+          onPress={goBack}
+          style={{ marginTop: 10 }}
+          disabled={sending}
+        />
       </ScrollView>
     </Screen>
   );
 }
 
-// =====================
-// REST OF SCREENS
-// =====================
+function Field({ label, value, setValue, placeholder }) {
+  return (
+    <View style={{ marginTop: 12 }}>
+      <Text style={{ color: COLORS.textSoft, fontWeight: "900", marginBottom: 8 }}>
+        {label}
+      </Text>
+      <View
+        style={{
+          borderRadius: 14,
+          borderWidth: 1,
+          borderColor: "rgba(255,255,255,0.10)",
+          backgroundColor: "rgba(255,255,255,0.04)",
+          paddingHorizontal: 12,
+          paddingVertical: 10,
+        }}
+      >
+        <TextInput
+          value={value}
+          onChangeText={setValue}
+          placeholder={placeholder}
+          placeholderTextColor="rgba(255,255,255,0.25)"
+          style={{ color: COLORS.text, fontWeight: "800" }}
+        />
+      </View>
+    </View>
+  );
+}
+
 function HistoryScreen({ goBack, go }) {
   const [items, setItems] = useState([]);
 
@@ -1159,17 +1996,38 @@ function HistoryScreen({ goBack, go }) {
             activeOpacity={0.85}
             onPress={async () => {
               await refresh();
-              safeAlert("Actualizado", "Historial refrescado.");
+              safeAlert("OK", "Historial actualizado.");
             }}
           >
             <Ionicons name="refresh-outline" size={20} color={COLORS.accent} />
           </TouchableOpacity>
         }
       />
+
       <View style={{ paddingHorizontal: 18, flex: 1 }}>
-        <Text style={{ color: COLORS.textSoft, marginBottom: 12 }}>
-          {items.length} escaneos realizados
-        </Text>
+        <Row style={{ justifyContent: "space-between", marginBottom: 12 }}>
+          <Text style={{ color: COLORS.textSoft, fontWeight: "800" }}>
+            {items.length} escaneos
+          </Text>
+          <TouchableOpacity
+            activeOpacity={0.85}
+            onPress={async () => {
+              Alert.alert("Borrar", "¿Borrar historial?", [
+                { text: "Cancelar", style: "cancel" },
+                {
+                  text: "Borrar",
+                  style: "destructive",
+                  onPress: async () => {
+                    await clearHistory();
+                    await refresh();
+                  },
+                },
+              ]);
+            }}
+          >
+            <Ionicons name="trash-outline" size={18} color={COLORS.warning} />
+          </TouchableOpacity>
+        </Row>
 
         {items.length === 0 ? (
           <Card style={{ alignItems: "center", paddingVertical: 32 }}>
@@ -1212,14 +2070,14 @@ function HistoryScreen({ goBack, go }) {
                       height: 56,
                       borderRadius: 12,
                       overflow: "hidden",
-                      backgroundColor: "#000",
+                      backgroundColor: "rgba(255,255,255,0.06)",
                       borderWidth: 1,
                       borderColor: "rgba(255,255,255,0.10)",
+                      alignItems: "center",
+                      justifyContent: "center",
                     }}
                   >
-                    {it.frontUri ? (
-                      <Image source={{ uri: it.frontUri }} style={{ width: "100%", height: "100%" }} />
-                    ) : null}
+                    <MaterialCommunityIcons name="key" size={22} color={COLORS.textSoft} />
                   </View>
 
                   <View style={{ flex: 1 }}>
@@ -1232,16 +2090,12 @@ function HistoryScreen({ goBack, go }) {
                     <Text style={{ color: COLORS.textSoft, marginTop: 4 }}>
                       Confianza: {Math.round((it.topConfidence || 0) * 100)}%
                     </Text>
-                    {it.pendingFeedbackCount ? (
-                      <Text style={{ color: COLORS.warning, marginTop: 4, fontWeight: "800" }}>
-                        Feedback pendiente: {it.pendingFeedbackCount}
+                    {it.low_confidence ? (
+                      <Text style={{ color: COLORS.warning, marginTop: 4, fontWeight: "900" }}>
+                        Dudoso (corregir manualmente)
                       </Text>
                     ) : null}
                   </View>
-
-                  <TouchableOpacity activeOpacity={0.85} onPress={() => safeAlert("Detalle", "Luego añadimos vista detalle.")}>
-                    <Ionicons name="chevron-forward" size={20} color={COLORS.textSoft} />
-                  </TouchableOpacity>
                 </Row>
               </Card>
             ))}
@@ -1276,7 +2130,7 @@ function TallerScreen({ goBack, go }) {
   return (
     <Screen>
       <TopTitle
-        title="Perfil Taller"
+        title="Taller"
         left={
           <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
             <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
@@ -1287,13 +2141,14 @@ function TallerScreen({ goBack, go }) {
             activeOpacity={0.85}
             onPress={async () => {
               await refresh();
-              safeAlert("Actualizado", "Stats refrescadas.");
+              safeAlert("OK", "Actualizado.");
             }}
           >
             <Ionicons name="refresh-outline" size={20} color={COLORS.accent} />
           </TouchableOpacity>
         }
       />
+
       <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 22 }}>
         <Card style={{ marginTop: 14 }}>
           <Row style={{ gap: 10 }}>
@@ -1303,7 +2158,7 @@ function TallerScreen({ goBack, go }) {
             </Text>
           </Row>
 
-          <Line label="Total de escaneos" value={String(stats.total)} />
+          <Line label="Total escaneos (sin fotos)" value={String(stats.total)} />
           <Line label="Feedback pendiente" value={String(stats.pending)} valueColor={COLORS.warning} />
 
           <OutlineButton
@@ -1323,9 +2178,9 @@ function TallerScreen({ goBack, go }) {
         </Card>
 
         <PrimaryButton
-          title="Ver historial completo"
-          icon={<Ionicons name="trending-up-outline" size={18} color="#fff" />}
-          onPress={() => go("History")}
+          title="Escanear otra llave"
+          icon={<Ionicons name="camera-outline" size={18} color="#fff" />}
+          onPress={() => go("Scan")}
           style={{ marginTop: 14 }}
         />
       </ScrollView>
@@ -1337,60 +2192,125 @@ function Line({ label, value, valueColor }) {
   return (
     <Row style={{ justifyContent: "space-between", marginTop: 10 }}>
       <Text style={{ color: COLORS.textSoft }}>{label}</Text>
-      <Text style={{ color: valueColor || COLORS.text, fontWeight: "900" }}>
-        {value}
-      </Text>
+      <Text style={{ color: valueColor || COLORS.text, fontWeight: "900" }}>{value}</Text>
     </Row>
   );
 }
 
-function Field({ label, value, onChangeText, placeholder }) {
+function GuideScreen({ goBack, go }) {
   return (
-    <View style={{ marginTop: 10 }}>
-      <Text style={{ color: COLORS.textSoft, fontWeight: "800", marginBottom: 6 }}>
-        {label}
-      </Text>
-      <TextInput
-        value={value}
-        onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor={"rgba(255,255,255,0.28)"}
-        style={{
-          backgroundColor: "rgba(255,255,255,0.05)",
-          borderWidth: 1,
-          borderColor: "rgba(255,255,255,0.08)",
-          borderRadius: 12,
-          paddingHorizontal: 12,
-          paddingVertical: 10,
-          color: COLORS.text,
-          fontWeight: "800",
-        }}
+    <Screen>
+      <TopTitle
+        title="Guía de captura"
+        left={
+          <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
+            <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+          </TouchableOpacity>
+        }
       />
-    </View>
+
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 26 }}>
+        <Card style={{ marginTop: 14 }}>
+          <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 18 }}>
+            Cómo hacer fotos que acierten
+          </Text>
+          <Text style={{ color: COLORS.textSoft, marginTop: 8, lineHeight: 20 }}>
+            1) Fondo blanco mate{"\n"}
+            2) Buena luz (si puedes, flash){"\n"}
+            3) Llave centrada y completa{"\n"}
+            4) Evita sombras fuertes y reflejos{"\n"}
+            5) Haz siempre lado A + lado B
+          </Text>
+        </Card>
+
+        <Card style={{ marginTop: 14 }}>
+          <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 16 }}>
+            Trucos rápidos
+          </Text>
+          <Row style={{ flexWrap: "wrap", marginTop: 8 }}>
+            <Tag text="Fondo blanco" tone="success" />
+            <Tag text="Luz fuerte" tone="accent" />
+            <Tag text="Sin movimiento" tone="accent" />
+            <Tag text="Punta visible" tone="accent" />
+            <Tag text="Cabezal visible" tone="accent" />
+          </Row>
+          <Text style={{ color: COLORS.textSoft, marginTop: 10 }}>
+            Si sale “dudoso”, usa “Corregir manualmente”.
+          </Text>
+        </Card>
+
+        <PrimaryButton
+          title="Ir a escanear"
+          icon={<Ionicons name="camera-outline" size={18} color="#fff" />}
+          onPress={() => go("Scan")}
+          style={{ marginTop: 14 }}
+        />
+      </ScrollView>
+    </Screen>
   );
 }
 
-// ✅ CORREGIDO: ahora acepta onResetDemo y muestra botón de reset
-function ConfigScreen({ goBack, onResetDemo }) {
-  const [health, setHealth] = useState(null);
-  const [loading, setLoading] = useState(false);
+function ProfileScreen({ goBack, go }) {
+  const [pending, setPending] = useState(0);
 
-  const refreshHealth = useCallback(async () => {
-    try {
-      setLoading(true);
-      const h = await fetchHealth();
-      setHealth(h);
-    } catch (e) {
-      setHealth({ ok: false, engine_error: String(e?.message || e) });
-    } finally {
-      setLoading(false);
-    }
+  const refresh = useCallback(async () => {
+    const p = await loadPendingFeedback();
+    setPending(p.length || 0);
   }, []);
 
   useEffect(() => {
-    refreshHealth();
-  }, [refreshHealth]);
+    refresh();
+  }, [refresh]);
 
+  return (
+    <Screen>
+      <TopTitle
+        title="Perfil"
+        left={
+          <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
+            <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+          </TouchableOpacity>
+        }
+      />
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 26 }}>
+        <Card style={{ marginTop: 14 }}>
+          <Row style={{ justifyContent: "space-between" }}>
+            <Text style={{ color: COLORS.text, fontWeight: "900" }}>Estado</Text>
+            <SmallPill text={pending ? `${pending} pendiente` : "OK"} tone={pending ? "warning" : "success"} />
+          </Row>
+          <Text style={{ color: COLORS.textSoft, marginTop: 10 }}>
+            Privacidad: el historial guarda solo metadatos (sin fotos).
+          </Text>
+
+          <OutlineButton
+            title="Enviar feedback pendiente"
+            icon={<Ionicons name="cloud-upload-outline" size={18} color={COLORS.accent} />}
+            onPress={async () => {
+              const r = await flushPendingFeedback();
+              await refresh();
+              safeAlert("Feedback", `Enviados: ${r.sent}\nPendientes: ${r.left}`);
+            }}
+            style={{ marginTop: 14 }}
+          />
+        </Card>
+
+        <Card style={{ marginTop: 14 }}>
+          <Text style={{ color: COLORS.text, fontWeight: "900" }}>Motor</Text>
+          <Text style={{ color: COLORS.textSoft, marginTop: 8 }}>{MOTOR_BASE}</Text>
+        </Card>
+
+        <PrimaryButton
+          title="Ir a ajustes"
+          icon={<Ionicons name="settings-outline" size={18} color="#fff" />}
+          onPress={() => go("Config")}
+          style={{ marginTop: 14 }}
+        />
+      </ScrollView>
+    </Screen>
+  );
+}
+
+function ConfigScreen({ goBack, onResetDemo }) {
   return (
     <Screen>
       <TopTitle
@@ -1405,7 +2325,7 @@ function ConfigScreen({ goBack, onResetDemo }) {
         <Text
           style={{
             color: COLORS.textSoft,
-            fontWeight: "800",
+            fontWeight: "900",
             letterSpacing: 1,
             fontSize: 12,
             marginTop: 16,
@@ -1419,7 +2339,7 @@ function ConfigScreen({ goBack, onResetDemo }) {
             <IconBox icon="information-circle-outline" />
             <View style={{ flex: 1 }}>
               <Text style={{ color: COLORS.text, fontWeight: "900" }}>Versión</Text>
-              <Text style={{ color: COLORS.textSoft, marginTop: 2 }}>v1.0.0</Text>
+              <Text style={{ color: COLORS.textSoft, marginTop: 2 }}>v1a1 (clean)</Text>
             </View>
           </Row>
 
@@ -1430,40 +2350,6 @@ function ConfigScreen({ goBack, onResetDemo }) {
             <View style={{ flex: 1 }}>
               <Text style={{ color: COLORS.text, fontWeight: "900" }}>Motor (Cloud Run)</Text>
               <Text style={{ color: COLORS.textSoft, marginTop: 2 }}>{MOTOR_BASE}</Text>
-            </View>
-          </Row>
-
-          <View style={{ height: 1, backgroundColor: "rgba(255,255,255,0.06)", marginVertical: 12 }} />
-
-          <Row style={{ gap: 12, alignItems: "flex-start" }}>
-            <IconBox icon="pulse-outline" />
-            <View style={{ flex: 1 }}>
-              <Row style={{ justifyContent: "space-between" }}>
-                <Text style={{ color: COLORS.text, fontWeight: "900" }}>Estado del motor</Text>
-                {loading ? (
-                  <ActivityIndicator />
-                ) : (
-                  <TouchableOpacity activeOpacity={0.85} onPress={refreshHealth}>
-                    <Ionicons name="refresh-outline" size={18} color={COLORS.accent} />
-                  </TouchableOpacity>
-                )}
-              </Row>
-
-              <Text style={{ color: (health?.ok ? COLORS.success : COLORS.danger), marginTop: 6, fontWeight: "900" }}>
-                {health?.ok ? "OK" : "OFFLINE"}
-              </Text>
-
-              {health?.engine_loaded === false ? (
-                <Text style={{ color: COLORS.warning, marginTop: 6, fontWeight: "800" }}>
-                  engine_loaded: false
-                </Text>
-              ) : null}
-
-              {health?.engine_error ? (
-                <Text style={{ color: COLORS.textSoft, marginTop: 6 }}>
-                  {String(health.engine_error)}
-                </Text>
-              ) : null}
             </View>
           </Row>
         </Card>
@@ -1477,7 +2363,7 @@ function ConfigScreen({ goBack, onResetDemo }) {
           />
         ) : null}
 
-        <Text style={{ textAlign: "center", color: COLORS.textSoft, marginTop: 20, fontWeight: "700" }}>
+        <Text style={{ textAlign: "center", color: COLORS.textSoft, marginTop: 20, fontWeight: "800" }}>
           ScanKey — Motor REAL
         </Text>
       </ScrollView>
@@ -1504,424 +2390,6 @@ function IconBox({ icon }) {
   );
 }
 
-function ResultsScreen({ goBack, go, scanDraft, onSaveToHistory, onNewScan }) {
-  const analysis = scanDraft?.analysis || null;
-  const [sending, setSending] = useState(false);
-
-  const topCandidate = analysis?.results?.[0] || null;
-  const { brand: topBrand, model: topModel } = parseModelTitle(topCandidate?.title);
-
-  const [manualOpen, setManualOpen] = useState(false);
-  const [manualBrand, setManualBrand] = useState(topBrand || "");
-  const [manualModel, setManualModel] = useState(topModel || topCandidate?.title || "");
-  const [manualType, setManualType] = useState("");
-  const [manualOrientation, setManualOrientation] = useState(topCandidate?.orientation || "");
-  const [manualOCR, setManualOCR] = useState("");
-  const [savedHistory, setSavedHistory] = useState(false);
-
-  if (!analysis) return <Placeholder title="Resultados" goBack={goBack} />;
-
-  const sendFeedback = async (candidate) => {
-    if (sending) return;
-
-    try {
-      setSending(true);
-
-      const { brand, model } = parseModelTitle(candidate?.title);
-      const payload = {
-        input_id:
-          scanDraft?.input_id ||
-          analysis?.input_id ||
-          String(scanDraft?.createdAt || Date.now()),
-        chosen_id_model_ref: candidate?.id_model_ref || null,
-        source: "app_real",
-        ocr_text: null,
-        correct_brand: brand,
-        correct_model: model || candidate?.title || null,
-        correct_type: null,
-        correct_orientation: candidate?.orientation || null,
-      };
-
-      await postFeedback(payload);
-      safeAlert("OK", "Corrección enviada al motor (Cloud Run).");
-    } catch (e) {
-      const count = await queueFeedback({
-        input_id:
-          scanDraft?.input_id ||
-          analysis?.input_id ||
-          String(scanDraft?.createdAt || Date.now()),
-        chosen_id_model_ref: candidate?.id_model_ref || null,
-        source: "app_real_queued",
-        ocr_text: null,
-        correct_brand: parseModelTitle(candidate?.title)?.brand ?? null,
-        correct_model:
-          parseModelTitle(candidate?.title)?.model ?? candidate?.title ?? null,
-        correct_type: null,
-        correct_orientation: candidate?.orientation || null,
-      });
-      safeAlert(
-        "Guardado (pendiente)",
-        `El motor no aceptó el feedback.\nLo guardé para reenviarlo luego.\nPendientes: ${count}`
-      );
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const sendManualFeedback = async () => {
-    if (sending) return;
-
-    const b = (manualBrand || "").trim() || null;
-    const m = (manualModel || "").trim() || null;
-    const t = (manualType || "").trim() || null;
-    const o = (manualOrientation || "").trim() || null;
-    const ocr = (manualOCR || "").trim() || null;
-
-    if (!b && !m && !t && !o && !ocr) {
-      safeAlert("Falta información", "Rellena al menos un campo antes de enviar.");
-      return;
-    }
-
-    try {
-      setSending(true);
-
-      const payload = {
-        input_id:
-          scanDraft?.input_id ||
-          analysis?.input_id ||
-          String(scanDraft?.createdAt || Date.now()),
-        chosen_id_model_ref: null,
-        source: "app_manual",
-        ocr_text: ocr,
-        correct_brand: b,
-        correct_model: m,
-        correct_type: t,
-        correct_orientation: o,
-      };
-
-      await postFeedback(payload);
-      safeAlert("OK", "Corrección manual enviada al motor (Cloud Run).");
-      setManualOpen(false);
-    } catch (e) {
-      const count = await queueFeedback({
-        input_id:
-          scanDraft?.input_id ||
-          analysis?.input_id ||
-          String(scanDraft?.createdAt || Date.now()),
-        chosen_id_model_ref: null,
-        source: "app_manual_queued",
-        ocr_text: ocr,
-        correct_brand: b,
-        correct_model: m,
-        correct_type: t,
-        correct_orientation: o,
-      });
-
-      safeAlert(
-        "Guardado (pendiente)",
-        `No se pudo enviar ahora.
-Quedó en cola.
-Pendientes: ${count}`
-      );
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const results = Array.isArray(analysis.results) ? analysis.results : [];
-
-  return (
-    <Screen>
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 140 }}>
-        <Row style={{ justifyContent: "space-between", marginTop: 12 }}>
-          <TouchableOpacity activeOpacity={0.8} onPress={goBack}>
-            <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
-          </TouchableOpacity>
-
-          <View style={{ flex: 1, alignItems: "center" }}>
-            <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 22 }}>
-              Resultados del análisis
-            </Text>
-            <Text style={{ color: COLORS.textSoft, marginTop: 4 }}>
-              Procesado en {analysis.processed_ms ?? "—"}ms
-            </Text>
-          </View>
-
-          <View style={{ width: 34 }} />
-        </Row>
-
-        <Card style={{ marginTop: 12, padding: 0, overflow: "hidden" }}>
-          <View
-            style={{
-              height: 160,
-              backgroundColor: "#000",
-              borderWidth: 2,
-              borderColor: "rgba(47,136,255,0.65)",
-              margin: 14,
-              borderRadius: 16,
-              overflow: "hidden",
-            }}
-          >
-            {scanDraft?.frontUri ? (
-              <Image
-                source={{ uri: scanDraft.frontUri }}
-                style={{ width: "100%", height: "100%" }}
-                resizeMode="cover"
-              />
-            ) : null}
-            <View style={{ position: "absolute", left: 12, top: 12 }}>
-              <SmallPill text="Llave escaneada" />
-            </View>
-          </View>
-        </Card>
-
-        {analysis?.high_confidence ? (
-          <Card style={{ marginTop: 12, borderColor: "rgba(32,201,151,0.35)" }}>
-            <Row style={{ gap: 10 }}>
-              <Ionicons name="shield-checkmark-outline" size={18} color={COLORS.success} />
-              <Text style={{ color: COLORS.success, fontWeight: "900" }}>
-                Alta confianza — puedes aceptar directo
-              </Text>
-            </Row>
-          </Card>
-        ) : null}
-
-        {analysis?.low_confidence ? (
-          <Card style={{ marginTop: 12, borderColor: "rgba(255,176,32,0.35)" }}>
-            <Row style={{ gap: 10 }}>
-              <Ionicons name="alert-circle-outline" size={18} color={COLORS.warning} />
-              <Text style={{ color: COLORS.warning, fontWeight: "900" }}>
-                Resultado dudoso — recomendado corregir manualmente
-              </Text>
-            </Row>
-          </Card>
-        ) : null}
-
-        {analysis?.manufacturer_hint?.found ? (
-          <Card style={{ marginTop: 12 }}>
-            <Row style={{ gap: 10 }}>
-              <Ionicons name="pricetag-outline" size={18} color={COLORS.accent} />
-              <Text style={{ color: COLORS.text, fontWeight: "900" }}>
-                Pista de fabricante: {analysis.manufacturer_hint?.name || "—"} (
-                {Math.round((analysis.manufacturer_hint?.confidence || 0) * 100)}%)
-              </Text>
-            </Row>
-          </Card>
-        ) : null}
-
-        {results.length ? (
-          results.map((r, idx) => (
-            <CandidateCard
-              key={r.rank ?? idx}
-              rank={r.rank ?? idx + 1}
-              title={r.title ?? "Modelo"}
-              id_model_ref={r.id_model_ref ?? null}
-              orientation={r.orientation ?? "—"}
-              headColor={r.headColor ?? "—"}
-              state={r.state ?? "—"}
-              tags={r.tags ?? []}
-              confidence={typeof r.confidence === "number" ? r.confidence : 0}
-              explain={r.explain ?? ""}
-              patent={!!r.patent}
-              sending={sending}
-              onCorrect={() => sendFeedback(r)}
-            />
-          ))
-        ) : (
-          <Card style={{ marginTop: 14 }}>
-            <Text style={{ color: COLORS.textSoft }}>
-              El motor respondió, pero no devolvió candidatos. Revisa el JSON del backend.
-            </Text>
-          </Card>
-        )}
-
-        <Card style={{ marginTop: 14 }}>
-          <Row style={{ justifyContent: "space-between", alignItems: "center" }}>
-            <Row style={{ gap: 10 }}>
-              <Ionicons name="create-outline" size={18} color={COLORS.textSoft} />
-              <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 16 }}>
-                Corrección manual
-              </Text>
-            </Row>
-
-            <TouchableOpacity activeOpacity={0.85} onPress={() => setManualOpen((v) => !v)}>
-              <Ionicons
-                name={manualOpen ? "chevron-up-outline" : "chevron-down-outline"}
-                size={20}
-                color={COLORS.accent}
-              />
-            </TouchableOpacity>
-          </Row>
-
-          {manualOpen ? (
-            <View style={{ marginTop: 12 }}>
-              <Text style={{ color: COLORS.textSoft, marginBottom: 10 }}>
-                Rellena lo que sepas. Con eso entrenamos el sistema.
-              </Text>
-
-              <Field label="Marca" value={manualBrand} onChangeText={setManualBrand} placeholder="Ej: JMA, TESA, CISA" />
-              <Field label="Modelo" value={manualModel} onChangeText={setManualModel} placeholder="Ej: TE5, TE8I, ... " />
-              <Field label="Tipo" value={manualType} onChangeText={setManualType} placeholder="Ej: plana, dimple, tubular..." />
-              <Field label="Orientación" value={manualOrientation} onChangeText={setManualOrientation} placeholder="izquierda / derecha / simétrica" />
-              <Field label="Texto (OCR)" value={manualOCR} onChangeText={setManualOCR} placeholder="Lo que pone en el cabezal" />
-
-              <PrimaryButton
-                title={sending ? "Enviando..." : "Enviar corrección manual"}
-                icon={<Ionicons name="send-outline" size={18} color="#fff" />}
-                onPress={sendManualFeedback}
-                disabled={sending}
-                style={{ marginTop: 12 }}
-              />
-            </View>
-          ) : null}
-        </Card>
-
-        <PrimaryButton
-          title={savedHistory ? "Guardado" : "Guardar en historial"}
-          icon={<Ionicons name="bookmark-outline" size={18} color="#fff" />}
-          onPress={async () => {
-            if (savedHistory) return;
-            await onSaveToHistory?.();
-            setSavedHistory(true);
-          }}
-          style={{ marginTop: 14, opacity: savedHistory ? 0.55 : 1 }}
-          disabled={savedHistory}
-        />
-
-        <Row style={{ gap: 12, marginTop: 12 }}>
-          <OutlineButton
-            title="Nuevo escaneo"
-            icon={<Ionicons name="refresh-outline" size={18} color={COLORS.accent} />}
-            onPress={onNewScan}
-            style={{ flex: 1 }}
-          />
-        </Row>
-      </ScrollView>
-    </Screen>
-  );
-}
-
-function CandidateCard({
-  rank,
-  title,
-  id_model_ref,
-  orientation,
-  headColor,
-  state,
-  tags,
-  confidence,
-  patent,
-  explain,
-  onCorrect,
-  sending,
-}) {
-  const safeTags = Array.isArray(tags) ? tags : [];
-
-  return (
-    <Card style={{ marginTop: 14, padding: 0, overflow: "hidden" }}>
-      <Row style={{ padding: 14, gap: 12 }}>
-        <View
-          style={{
-            width: 64,
-            height: 64,
-            borderRadius: 14,
-            backgroundColor: "rgba(255,255,255,0.06)",
-            borderWidth: 1,
-            borderColor: "rgba(255,255,255,0.08)",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <MaterialCommunityIcons name="key" size={28} color={COLORS.textSoft} />
-        </View>
-
-        <View style={{ flex: 1 }}>
-          <Row style={{ gap: 10 }}>
-            <SmallPill text={`#${rank}`} />
-            {patent && <Tag text="PATENTADA" tone="warning" />}
-          </Row>
-
-          <Text style={{ color: COLORS.text, fontWeight: "900", fontSize: 18, marginTop: 8 }}>
-            {title}
-          </Text>
-
-          <Text style={{ color: COLORS.textSoft, marginTop: 6 }}>
-            Orientación: {orientation}
-          </Text>
-          <Text style={{ color: COLORS.textSoft, marginTop: 2 }}>
-            Color cabezal: {headColor}
-          </Text>
-          <Text style={{ color: COLORS.textSoft, marginTop: 2 }}>
-            Estado: {state}
-          </Text>
-
-          <Row style={{ flexWrap: "wrap", marginTop: 2 }}>
-            {safeTags.map((t) => (
-              <Tag key={t} text={t} />
-            ))}
-          </Row>
-
-          <View style={{ marginTop: 10 }}>
-            <Row style={{ justifyContent: "space-between" }}>
-              <Text style={{ color: COLORS.textSoft, fontWeight: "800" }}>
-                Confianza
-              </Text>
-              <Text style={{ color: COLORS.textSoft, fontWeight: "900" }}>
-                {typeof confidence === "number"
-                  ? (confidence * 100).toFixed(1)
-                  : "—"}
-                %
-              </Text>
-            </Row>
-            <View
-              style={{
-                height: 8,
-                borderRadius: 999,
-                backgroundColor: "rgba(255,255,255,0.08)",
-                marginTop: 8,
-                overflow: "hidden",
-              }}
-            >
-              <View
-                style={{
-                  height: 8,
-                  width: `${Math.max(
-                    0,
-                    Math.min(100, (confidence || 0) * 100)
-                  )}%`,
-                  backgroundColor: COLORS.accent,
-                }}
-              />
-            </View>
-          </View>
-
-          {!!explain && (
-            <Text style={{ color: COLORS.textSoft, marginTop: 10, fontStyle: "italic" }}>
-              "{explain}"
-            </Text>
-          )}
-
-          {id_model_ref ? (
-            <Text style={{ color: "rgba(255,255,255,0.35)", marginTop: 8 }}>
-              ref: {id_model_ref}
-            </Text>
-          ) : null}
-        </View>
-      </Row>
-
-      <View style={{ paddingHorizontal: 14, paddingBottom: 14 }}>
-        <PrimaryButton
-          title={sending ? "Enviando..." : "Esta es correcta"}
-          icon={<Ionicons name="checkmark-circle-outline" size={18} color="#fff" />}
-          onPress={onCorrect}
-          disabled={sending}
-          style={{ backgroundColor: "#19B36B" }}
-        />
-      </View>
-    </Card>
-  );
-}
-
 // =====================
 // WEB fallback mini-router + Tabs
 // =====================
@@ -1944,20 +2412,21 @@ function WebShell() {
   const onSaveToHistory = async () => {
     if (!scanDraft?.analysis) return;
     const h = await loadHistory();
-    const pending = await loadPendingFeedback();
     const top = scanDraft.analysis.results?.[0] || null;
+
     const item = {
       id: String(Date.now()),
       createdAt: scanDraft.createdAt || Date.now(),
-      frontUri: scanDraft.frontUri || null,
-      backUri: scanDraft.backUri || null,
-      topTitle: top?.title || "Resultado",
+      input_id: scanDraft.input_id || scanDraft.analysis.input_id || null,
+      topTitle: `${top?.brand || ""} ${top?.model || ""}`.trim() || "Resultado",
       topConfidence: top?.confidence || 0,
-      pendingFeedbackCount: pending.length || 0,
+      low_confidence: !!scanDraft.analysis.low_confidence,
+      high_confidence: !!scanDraft.analysis.high_confidence,
     };
+
     const next = [item, ...h];
     await saveHistory(next);
-    safeAlert("Guardado", "Añadido al historial.");
+    safeAlert("Guardado", "Añadido al historial (sin fotos).");
   };
 
   const onNewScan = () => {
@@ -1978,10 +2447,6 @@ function WebShell() {
           onResetScanDraft={resetScanRef}
         />
       );
-    if (current === "History") return <HistoryScreen go={go} goBack={goBack} />;
-    if (current === "Taller") return <TallerScreen go={go} goBack={goBack} />;
-    if (current === "Config")
-      return <ConfigScreen goBack={goBack} onResetDemo={onResetDemo} />;
     if (current === "Results")
       return (
         <ResultsScreen
@@ -1992,9 +2457,31 @@ function WebShell() {
           onNewScan={onNewScan}
         />
       );
-    if (current === "Guide") return <Placeholder title="Guía de captura" goBack={goBack} />;
-    if (current === "Profile") return <Placeholder title="Perfil" goBack={goBack} />;
-    return <Placeholder title={current} goBack={goBack} />;
+    if (current === "Manual")
+      return <ManualCorrectionScreen goBack={goBack} go={go} scanDraft={scanDraft} />;
+    if (current === "History") return <HistoryScreen go={go} goBack={goBack} />;
+    if (current === "Taller") return <TallerScreen go={go} goBack={goBack} />;
+    if (current === "Guide") return <GuideScreen go={go} goBack={goBack} />;
+    if (current === "Profile") return <ProfileScreen go={go} goBack={goBack} />;
+    if (current === "Config") return <ConfigScreen goBack={goBack} onResetDemo={onResetDemo} />;
+
+    return (
+      <Screen>
+        <TopTitle
+          title={current}
+          left={
+            <TouchableOpacity onPress={goBack}>
+              <Ionicons name="arrow-back" size={22} color={COLORS.accent} />
+            </TouchableOpacity>
+          }
+        />
+        <View style={{ paddingHorizontal: 18 }}>
+          <Card>
+            <Text style={{ color: COLORS.textSoft }}>Pantalla no encontrada.</Text>
+          </Card>
+        </View>
+      </Screen>
+    );
   };
 
   const setTabRoute = (t) => {
@@ -2023,15 +2510,11 @@ function WebTabBar({ tab, setTab }) {
         onPress={() => setTab(name)}
         style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingTop: 8 }}
       >
-        <Ionicons
-          name={icon}
-          size={22}
-          color={active ? COLORS.accent : "rgba(255,255,255,0.55)"}
-        />
+        <Ionicons name={icon} size={22} color={active ? COLORS.accent : "rgba(255,255,255,0.55)"} />
         <Text
           style={{
             color: active ? COLORS.accent : "rgba(255,255,255,0.55)",
-            fontWeight: "700",
+            fontWeight: "800",
             fontSize: 12,
             marginTop: 2,
           }}
@@ -2071,11 +2554,7 @@ function NativeApp() {
   const tabs = safeRequire("@react-navigation/bottom-tabs");
   const stack = safeRequire("@react-navigation/native-stack");
 
-  if (
-    !nav?.NavigationContainer ||
-    !tabs?.createBottomTabNavigator ||
-    !stack?.createNativeStackNavigator
-  ) {
+  if (!nav?.NavigationContainer || !tabs?.createBottomTabNavigator || !stack?.createNativeStackNavigator) {
     return <WebShell />;
   }
 
@@ -2090,7 +2569,7 @@ function NativeApp() {
   const resetScanRef = useRef(null);
 
   const onResetDemo = async () => {
-    Alert.alert("Resetear", "¿Seguro que quieres borrar todo el historial?", [
+    Alert.alert("Resetear", "¿Borrar historial y feedback?", [
       { text: "Cancelar", style: "cancel" },
       {
         text: "Borrar",
@@ -2098,7 +2577,7 @@ function NativeApp() {
         onPress: async () => {
           await clearHistory();
           await clearPendingFeedback();
-          Alert.alert("OK", "Historial y feedback pendiente eliminados.");
+          Alert.alert("OK", "Eliminado.");
         },
       },
     ]);
@@ -2107,32 +2586,27 @@ function NativeApp() {
   const onSaveToHistory = async () => {
     if (!scanDraft?.analysis) return;
     const h = await loadHistory();
-    const pending = await loadPendingFeedback();
     const top = scanDraft.analysis.results?.[0] || null;
+
     const item = {
       id: String(Date.now()),
       createdAt: scanDraft.createdAt || Date.now(),
-      frontUri: scanDraft.frontUri || null,
-      backUri: scanDraft.backUri || null,
-      topTitle: top?.title || "Resultado",
+      input_id: scanDraft.input_id || scanDraft.analysis.input_id || null,
+      topTitle: `${top?.brand || ""} ${top?.model || ""}`.trim() || "Resultado",
       topConfidence: top?.confidence || 0,
-      pendingFeedbackCount: pending.length || 0,
+      low_confidence: !!scanDraft.analysis.low_confidence,
+      high_confidence: !!scanDraft.analysis.high_confidence,
     };
+
     const next = [item, ...h];
     await saveHistory(next);
-    Alert.alert("Guardado", "Añadido al historial.");
+    Alert.alert("Guardado", "Añadido al historial (sin fotos).");
   };
 
   function StackShell({ initial }) {
     return (
-      <Stack.Navigator
-        screenOptions={{ headerShown: false }}
-        initialRouteName={initial}
-      >
-        <Stack.Screen
-          name="Home"
-          children={(p) => <HomeScreen go={(n) => p.navigation.navigate(n)} />}
-        />
+      <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={initial}>
+        <Stack.Screen name="Home" children={(p) => <HomeScreen go={(n) => p.navigation.navigate(n)} />} />
         <Stack.Screen
           name="Scan"
           children={(p) => (
@@ -2141,33 +2615,6 @@ function NativeApp() {
               goBack={() => p.navigation.goBack()}
               setScanDraft={setScanDraft}
               onResetScanDraft={resetScanRef}
-            />
-          )}
-        />
-        <Stack.Screen
-          name="History"
-          children={(p) => (
-            <HistoryScreen
-              go={(n) => p.navigation.navigate(n)}
-              goBack={() => p.navigation.goBack()}
-            />
-          )}
-        />
-        <Stack.Screen
-          name="Taller"
-          children={(p) => (
-            <TallerScreen
-              go={(n) => p.navigation.navigate(n)}
-              goBack={() => p.navigation.goBack()}
-            />
-          )}
-        />
-        <Stack.Screen
-          name="Config"
-          children={(p) => (
-            <ConfigScreen
-              goBack={() => p.navigation.goBack()}
-              onResetDemo={onResetDemo}
             />
           )}
         />
@@ -2187,21 +2634,12 @@ function NativeApp() {
             />
           )}
         />
-        <Stack.Screen
-          name="Guide"
-          children={(p) => (
-            <Placeholder
-              title="Guía de captura"
-              goBack={() => p.navigation.goBack()}
-            />
-          )}
-        />
-        <Stack.Screen
-          name="Profile"
-          children={(p) => (
-            <Placeholder title="Perfil" goBack={() => p.navigation.goBack()} />
-          )}
-        />
+        <Stack.Screen name="Manual" children={(p) => <ManualCorrectionScreen go={(n) => p.navigation.navigate(n)} goBack={() => p.navigation.goBack()} scanDraft={scanDraft} />} />
+        <Stack.Screen name="History" children={(p) => <HistoryScreen go={(n) => p.navigation.navigate(n)} goBack={() => p.navigation.goBack()} />} />
+        <Stack.Screen name="Taller" children={(p) => <TallerScreen go={(n) => p.navigation.navigate(n)} goBack={() => p.navigation.goBack()} />} />
+        <Stack.Screen name="Guide" children={(p) => <GuideScreen go={(n) => p.navigation.navigate(n)} goBack={() => p.navigation.goBack()} />} />
+        <Stack.Screen name="Profile" children={(p) => <ProfileScreen go={(n) => p.navigation.navigate(n)} goBack={() => p.navigation.goBack()} />} />
+        <Stack.Screen name="Config" children={(p) => <ConfigScreen goBack={() => p.navigation.goBack()} onResetDemo={onResetDemo} />} />
       </Stack.Navigator>
     );
   }
@@ -2221,7 +2659,7 @@ function NativeApp() {
           },
           tabBarActiveTintColor: COLORS.accent,
           tabBarInactiveTintColor: "rgba(255,255,255,0.55)",
-          tabBarLabelStyle: { fontWeight: "700", fontSize: 12 },
+          tabBarLabelStyle: { fontWeight: "800", fontSize: 12 },
           tabBarIcon: ({ color, focused }) => {
             const map = {
               HomeTab: focused ? "home" : "home-outline",
@@ -2234,37 +2672,16 @@ function NativeApp() {
           },
         })}
       >
-        <Tab.Screen
-          name="HomeTab"
-          children={() => <StackShell initial="Home" />}
-          options={{ title: "Home" }}
-        />
-        <Tab.Screen
-          name="ScanTab"
-          children={() => <StackShell initial="Scan" />}
-          options={{ title: "Escanear" }}
-        />
-        <Tab.Screen
-          name="HistoryTab"
-          children={() => <StackShell initial="History" />}
-          options={{ title: "Historial" }}
-        />
-        <Tab.Screen
-          name="TallerTab"
-          children={() => <StackShell initial="Taller" />}
-          options={{ title: "Taller" }}
-        />
-        <Tab.Screen
-          name="ConfigTab"
-          children={() => <StackShell initial="Config" />}
-          options={{ title: "Config" }}
-        />
+        <Tab.Screen name="HomeTab" children={() => <StackShell initial="Home" />} options={{ title: "Home" }} />
+        <Tab.Screen name="ScanTab" children={() => <StackShell initial="Scan" />} options={{ title: "Escanear" }} />
+        <Tab.Screen name="HistoryTab" children={() => <StackShell initial="History" />} options={{ title: "Historial" }} />
+        <Tab.Screen name="TallerTab" children={() => <StackShell initial="Taller" />} options={{ title: "Taller" }} />
+        <Tab.Screen name="ConfigTab" children={() => <StackShell initial="Config" />} options={{ title: "Config" }} />
       </Tab.Navigator>
     </NavigationContainer>
   );
 }
 
-}
 export default function App() {
   if (Platform.OS === "web") return <WebShell />;
   return <NativeApp />;

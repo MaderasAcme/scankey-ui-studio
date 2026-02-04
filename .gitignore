@@ -59,3 +59,17 @@ backup-base44/
 *.base44.app/
 _git_mistakes/
 dist/
+
+# --- ScanKey: seguridad / basura ---
+github-recovery-codes.txt
+credentials.json
+*.pem
+*.p12
+.env
+.env.*
+__pycache__/
+.venv/
+node_modules/
+.expo/
+dist/
+App.js.bak.*
