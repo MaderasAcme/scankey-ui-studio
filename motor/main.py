@@ -51,50 +51,59 @@ app = FastAPI()
 
 
 
-# --- Legacy compat: always provide out["results"] as 3 items derived from candidates ---
+# --- Legacy compat: ensure out["results"] exists as 3 items derived from candidates ---
 from starlette.responses import Response
 
 @app.middleware("http")
 async def legacy_results_middleware(request, call_next):
     resp = await call_next(request)
 
-    if request.url.path != "/api/analyze-key":
-        return resp
-    if resp.status_code != 200:
+    if request.url.path != "/api/analyze-key" or resp.status_code != 200:
         return resp
 
     ctype = (resp.headers.get("content-type") or "")
     if "application/json" not in ctype:
         return resp
 
+    # Read body safely (resp may be streaming)
     body = b""
-    async for chunk in resp.body_iterator:
-        body += chunk
+    if getattr(resp, "body", None):
+        body = resp.body
+    else:
+        async for chunk in resp.body_iterator:
+            body += chunk
 
+    if not body:
+        return resp
+
+    import json
     try:
-        out = json.loads(body.decode("utf-8"))
+        obj = json.loads(body.decode("utf-8"))
     except Exception:
-        return Response(content=body, status_code=resp.status_code, headers=dict(resp.headers), media_type=resp.media_type)
+        return Response(content=body, status_code=resp.status_code, media_type="application/json")
 
-    cands = out.get("candidates") or []
-    results = []
-    for c in cands[:3]:
-        label = c.get("label")
-        score = float(c.get("score") or 0.0)
-        results.append({"type":"key","brand":None,"model":label,"confidence":score,"ref":label})
+    res = obj.get("results") or []
+    if isinstance(res, list) and len(res) == 3:
+        return Response(content=body, status_code=resp.status_code, media_type="application/json")
+
+    cands = obj.get("candidates") or []
+    results=[]
+    if isinstance(cands, list):
+        for c in cands[:3]:
+            model = c.get("label") or c.get("model") or c.get("ref") or None
+            conf  = c.get("score") if c.get("score") is not None else c.get("confidence")
+            try: conf = float(conf)
+            except Exception: conf = None
+            results.append({"model": model, "confidence": conf})
 
     while len(results) < 3:
-        results.append({"type":"key","brand":None,"model":None,"confidence":0.0,"ref":None,"reason":"no_candidate"})
+        results.append({"model": None, "confidence": None})
 
-    out["results"] = results
+    obj["results"] = results
+    new_body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
-    new_body = json.dumps(out, ensure_ascii=False).encode("utf-8")
-    headers = dict(resp.headers)
-    headers["content-length"] = str(len(new_body))
-    return Response(content=new_body, status_code=resp.status_code, headers=headers, media_type="application/json")
-# --- end legacy compat ---
+    return Response(content=new_body, status_code=resp.status_code, media_type="application/json")
 
-# --- ScanKey bootstrap event (REAL) ---
 @app.on_event("startup")
 def _scankey_bootstrap_event():
     from model_bootstrap import ensure_model
