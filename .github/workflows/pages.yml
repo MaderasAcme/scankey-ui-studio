@@ -1,8 +1,8 @@
-name: Deploy Web (Expo) to GitHub Pages
+name: Deploy Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -18,50 +18,24 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: "18"
+          cache: "npm"
 
-      - name: Install deps
-        run: npm ci
+      - run: npm ci
+      - run: npx expo export --platform web
 
-      - name: Build web (Expo export)
-        env:
-          EXPO_PUBLIC_MOTOR_BASE: https://classify-llaves-2apb4vvlhq-ew.a.run.app
-        run: npx expo export --platform web --output-dir dist
-
-      # SPA routing: cualquier ruta -> index.html
-      - name: SPA fallback (404.html)
-        run: cp dist/index.html dist/404.html
-
-      # Evita Jekyll en Pages
-      - name: Disable Jekyll
-        run: touch dist/.nojekyll
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
   deploy:
-    needs: build
     runs-on: ubuntu-latest
+    needs: build
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v4
