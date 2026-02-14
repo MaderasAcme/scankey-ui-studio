@@ -1,6 +1,0 @@
-.git
-node_modules
-.expo
-dist
-*.log
-App.js.bak.*
